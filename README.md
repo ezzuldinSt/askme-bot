@@ -1,3 +1,5 @@
+> **العربية:** [اقرأ النسخة العربية](README.ar.md)
+
 # AskMe — the Things AI bot 🤖
 
 Meet **AskMe**, a friendly AI assistant that lives on the [Things](https://things.cv) social network. When you need a quick answer, an opinion, or a look at a photo, just @mention AskMe — it will jump in and reply.
