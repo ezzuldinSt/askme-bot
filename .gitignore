@@ -1,0 +1,5 @@
+/target
+.env
+.token.json
+.processed-ids.json
+.DS_Store
