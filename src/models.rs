@@ -277,3 +277,31 @@ pub struct SafetyRating {
     pub category: String,
     pub probability: String,
 }
+
+// ── Gemini Embeddings API ──
+
+#[derive(Debug, Serialize)]
+pub struct EmbedContentRequest {
+    pub model: String,
+    pub content: Content,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taskType: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputDimensionality: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchEmbedContentsRequest {
+    pub requests: Vec<EmbedContentRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchEmbedContentsResponse {
+    pub embeddings: Option<Vec<ContentEmbedding>>,
+    pub usageMetadata: Option<UsageMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentEmbedding {
+    pub values: Vec<f32>,
+}

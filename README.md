@@ -47,3 +47,45 @@ Each mention is handled exactly once, even if the network hiccups. No double rep
 AskMe is running round-the-clock on Things. If you've seen its replies around the feed, that's the bot you're talking to.
 
 If you have ideas for new things AskMe should learn to do, feel free to say so in a post — you might even find it on the other end of the thread.
+
+---
+
+## Running it yourself
+
+AskMe needs three things: the Things login (email + OTP), a Gemini API key, and a local [Qdrant](https://qdrant.tech) instance for its conversation memory.
+
+```bash
+# 1. Start Qdrant (Docker) — stores the bot's persistent memory
+./scripts/start_qdrant.sh
+
+# 2. Configure secrets
+cp .env.example .env   # then fill in GEMINI_API_KEY, THINGS_EMAIL, THINGS_PASSWORD
+
+# 3. Run the bot
+cargo run
+```
+
+The bot keeps working even if Qdrant is down — it just falls back to a degraded
+memory-less mode (no cross-restart dedup, no conversation recall).
+
+### Environment variables
+
+| Variable                | Default                    | Description                                        |
+| ----------------------- | -------------------------- | -------------------------------------------------- |
+| `GEMINI_API_KEY`        | — (required)               | Gemini API key for chat and embeddings.            |
+| `THINGS_EMAIL`          | — (required)               | Things account email (login uses OTP).             |
+| `THINGS_PASSWORD`       | — (required)               | Things account password.                           |
+| `QDRANT_URL`            | `http://localhost:6334`    | Qdrant gRPC endpoint (port 6334, not 6333).        |
+| `EMBEDDING_MODEL`       | `gemini-embedding-001`     | Embeddings model for indexing messages.            |
+| `EMBEDDING_DIMENSIONS`  | `512`                      | Embedding vector size (must match collection).     |
+| `EMBEDDING_BATCH_SIZE`  | `10`                       | Texts per `batchEmbedContents` call.               |
+| `CONTEXT_SEARCH_LIMIT`  | `50`                       | Max hits returned by semantic memory recall.       |
+| `CONTEXT_DEPTH_LIMIT`   | `20`                       | Max thread messages included in a follow-up prompt.|
+
+### Developer tools
+
+- `cargo run -- --test-post <id>` — dry-run: loads post `<id>`, prints the Qdrant
+  memory state, the generated prompt, and the raw Gemini reply without posting.
+  Add `--post` to actually post the reply, or `--prompt "text"` to override the prompt.
+- `cargo test` — unit tests (entity formatting, memory serialization, embedder).
+

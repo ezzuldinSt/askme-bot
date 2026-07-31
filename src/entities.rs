@@ -69,7 +69,11 @@ fn find_at_handles(text: &str) -> Vec<(u64, u64)> {
 
     while i < chars.len() {
         if chars[i] == '@' {
-            let prev_ok = i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | ',' | ';');
+            let prev_ok = i == 0
+                || matches!(
+                    chars[i - 1],
+                    ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | ',' | ';'
+                );
             if prev_ok {
                 let mut j = i + 1;
                 while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {

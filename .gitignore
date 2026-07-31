@@ -3,3 +3,6 @@
 .token.json
 .processed-ids.json
 .DS_Store
+
+# Qdrant data
+qdrant_data/

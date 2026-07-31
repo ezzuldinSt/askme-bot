@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use reqwest::multipart::Form;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -53,7 +53,9 @@ impl ThingsClient {
 
     fn save_token(&self) -> Result<()> {
         if let Some(ref token) = self.token {
-            let cached = CachedToken { token: token.clone() };
+            let cached = CachedToken {
+                token: token.clone(),
+            };
             let content = serde_json::to_string_pretty(&cached)?;
             std::fs::write(TOKEN_FILE, content)?;
             info!("Saved auth token to {TOKEN_FILE}");
@@ -104,8 +106,8 @@ impl ThingsClient {
             anyhow::bail!("OTP verification error (HTTP {status}): {text}");
         }
 
-        let verify_resp: VerifyOtpResponse = serde_json::from_slice(&bytes)
-            .context("Failed to parse OTP verification response")?;
+        let verify_resp: VerifyOtpResponse =
+            serde_json::from_slice(&bytes).context("Failed to parse OTP verification response")?;
 
         let token = verify_resp
             .data
@@ -140,13 +142,15 @@ impl ThingsClient {
                 anyhow::bail!("Unread count error (HTTP {status}): {text}");
             }
 
-            let envelope: UnreadCountResponse = serde_json::from_slice(&bytes)
-                .context("Failed to parse unread count response")?;
+            let envelope: UnreadCountResponse =
+                serde_json::from_slice(&bytes).context("Failed to parse unread count response")?;
 
-            Ok(envelope.count
+            Ok(envelope
+                .count
                 .or_else(|| envelope.data.and_then(|d| d.count))
                 .unwrap_or(0))
-        }).await
+        })
+        .await
     }
 
     pub async fn get_notifications(&self, page: u32) -> Result<Vec<Notification>> {
@@ -168,13 +172,12 @@ impl ThingsClient {
                 anyhow::bail!("Notifications error (HTTP {status}): {text}");
             }
 
-            let envelope: NotificationsEnvelope = serde_json::from_slice(&bytes)
-                .context("Failed to parse notifications response")?;
+            let envelope: NotificationsEnvelope =
+                serde_json::from_slice(&bytes).context("Failed to parse notifications response")?;
 
-            Ok(envelope.data
-                .or(envelope.notifications)
-                .unwrap_or_default())
-        }).await
+            Ok(envelope.data.or(envelope.notifications).unwrap_or_default())
+        })
+        .await
     }
 
     pub async fn get_post(&self, post_id: u64) -> Result<PostData> {
@@ -196,11 +199,12 @@ impl ThingsClient {
                 anyhow::bail!("Get post error (HTTP {status}): {text}");
             }
 
-            let envelope: PostEnvelope = serde_json::from_slice(&bytes)
-                .context("Failed to parse post response")?;
+            let envelope: PostEnvelope =
+                serde_json::from_slice(&bytes).context("Failed to parse post response")?;
 
             envelope.data.context("Post response missing data field")
-        }).await
+        })
+        .await
     }
 
     pub async fn reply_to_post(
@@ -231,14 +235,16 @@ impl ThingsClient {
                 anyhow::bail!("Reply error (HTTP {status}): {text}");
             }
 
-            let reply: ReplyResponse = serde_json::from_slice(&bytes)
-                .context("Failed to parse reply response")?;
+            let reply: ReplyResponse =
+                serde_json::from_slice(&bytes).context("Failed to parse reply response")?;
 
-            reply.id
+            reply
+                .id
                 .or(reply.post_id)
                 .or_else(|| reply.data.as_ref().and_then(|d| d.id.or(d.post_id)))
                 .ok_or_else(|| anyhow::anyhow!("Reply response missing post ID"))
-        }).await
+        })
+        .await
     }
 
     pub async fn mark_notifications_read(&self, ids: &[u64]) -> Result<()> {
@@ -264,7 +270,8 @@ impl ThingsClient {
             }
 
             Ok(())
-        }).await
+        })
+        .await
     }
 
     pub async fn download_media(&self, url: &str) -> Result<(Vec<u8>, String)> {
@@ -288,8 +295,7 @@ impl ThingsClient {
             .unwrap_or("application/octet-stream")
             .to_string();
 
-        let bytes = resp.bytes().await
-            .context("Failed to read media bytes")?;
+        let bytes = resp.bytes().await.context("Failed to read media bytes")?;
 
         let len = bytes.len();
         info!("Downloaded {len} bytes from {url} (type: {content_type})");
@@ -298,7 +304,9 @@ impl ThingsClient {
     }
 
     fn auth_headers(&self) -> Result<reqwest::header::HeaderMap> {
-        let token = self.token.as_ref()
+        let token = self
+            .token
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
         let mut headers = reqwest::header::HeaderMap::new();
         let auth_value = format!("Bearer {token}");
@@ -357,6 +365,7 @@ impl ThingsClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
     }
 }
