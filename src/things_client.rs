@@ -3,16 +3,65 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::multipart::Form;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::models::*;
 
 const THINGS_API_BASE: &str = "https://things.cv/api";
-const TOKEN_FILE: &str = ".token.json";
+pub const TOKEN_FILE: &str = ".token.json";
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1000;
+
+/// Raised on HTTP 401: the cached auth token is expired or invalid and the bot
+/// cannot recover on its own (login requires an interactive OTP).
+#[derive(Debug, thiserror::Error)]
+#[error("Things auth token expired or invalid (HTTP 401)")]
+pub struct AuthExpired;
+
+/// True if the error (or anything in its chain) is an `AuthExpired`.
+pub fn is_auth_expired(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<AuthExpired>().is_some())
+}
+
+/// Internal error classification so the retry loop only retries failures that
+/// can actually heal on their own.
+enum RequestError {
+    /// Transport errors, timeouts, 429 and 5xx — worth retrying.
+    Retryable(anyhow::Error),
+    /// Other 4xx client errors — retrying the same request won't help.
+    Fatal(anyhow::Error),
+    /// 401 — surfaced to the caller as `AuthExpired`.
+    AuthExpired,
+}
+
+impl From<RequestError> for anyhow::Error {
+    fn from(e: RequestError) -> Self {
+        match e {
+            RequestError::Retryable(e) | RequestError::Fatal(e) => e,
+            RequestError::AuthExpired => AuthExpired.into(),
+        }
+    }
+}
+
+fn transport_error(context: &'static str) -> impl Fn(reqwest::Error) -> RequestError {
+    move |e| RequestError::Retryable(anyhow::Error::new(e).context(context))
+}
+
+fn http_error(status: StatusCode, context: &str, body: &[u8]) -> RequestError {
+    if status == StatusCode::UNAUTHORIZED {
+        return RequestError::AuthExpired;
+    }
+    let text = String::from_utf8_lossy(body);
+    let err = anyhow::anyhow!("{context} (HTTP {status}): {text}");
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        RequestError::Retryable(err)
+    } else {
+        RequestError::Fatal(err)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedToken {
@@ -129,21 +178,27 @@ impl ThingsClient {
             let resp = self
                 .client
                 .get(&url)
-                .headers(self.auth_headers()?)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
                 .send()
                 .await
-                .context("Failed to fetch unread count")?;
+                .map_err(transport_error("Failed to fetch unread count"))?;
 
             let status = resp.status();
-            let bytes = resp.bytes().await?;
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read unread count response"))?;
 
             if !status.is_success() {
-                let text = String::from_utf8_lossy(&bytes);
-                anyhow::bail!("Unread count error (HTTP {status}): {text}");
+                return Err(http_error(status, "Unread count error", &bytes));
             }
 
-            let envelope: UnreadCountResponse =
-                serde_json::from_slice(&bytes).context("Failed to parse unread count response")?;
+            let envelope: UnreadCountResponse = serde_json::from_slice(&bytes)
+                .map_err(|e| {
+                    RequestError::Fatal(
+                        anyhow::Error::new(e).context("Failed to parse unread count response"),
+                    )
+                })?;
 
             Ok(envelope
                 .count
@@ -159,21 +214,27 @@ impl ThingsClient {
             let resp = self
                 .client
                 .get(&url)
-                .headers(self.auth_headers()?)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
                 .send()
                 .await
-                .context("Failed to fetch notifications")?;
+                .map_err(transport_error("Failed to fetch notifications"))?;
 
             let status = resp.status();
-            let bytes = resp.bytes().await?;
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read notifications response"))?;
 
             if !status.is_success() {
-                let text = String::from_utf8_lossy(&bytes);
-                anyhow::bail!("Notifications error (HTTP {status}): {text}");
+                return Err(http_error(status, "Notifications error", &bytes));
             }
 
-            let envelope: NotificationsEnvelope =
-                serde_json::from_slice(&bytes).context("Failed to parse notifications response")?;
+            let envelope: NotificationsEnvelope = serde_json::from_slice(&bytes)
+                .map_err(|e| {
+                    RequestError::Fatal(
+                        anyhow::Error::new(e).context("Failed to parse notifications response"),
+                    )
+                })?;
 
             Ok(envelope.data.or(envelope.notifications).unwrap_or_default())
         })
@@ -186,65 +247,72 @@ impl ThingsClient {
             let resp = self
                 .client
                 .get(&url)
-                .headers(self.auth_headers()?)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
                 .send()
                 .await
-                .context("Failed to fetch post")?;
+                .map_err(transport_error("Failed to fetch post"))?;
 
             let status = resp.status();
-            let bytes = resp.bytes().await?;
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read post response"))?;
 
             if !status.is_success() {
-                let text = String::from_utf8_lossy(&bytes);
-                anyhow::bail!("Get post error (HTTP {status}): {text}");
+                return Err(http_error(status, "Get post error", &bytes));
             }
 
-            let envelope: PostEnvelope =
-                serde_json::from_slice(&bytes).context("Failed to parse post response")?;
+            let envelope: PostEnvelope = serde_json::from_slice(&bytes).map_err(|e| {
+                RequestError::Fatal(
+                    anyhow::Error::new(e).context("Failed to parse post response"),
+                )
+            })?;
 
-            envelope.data.context("Post response missing data field")
+            envelope
+                .data
+                .context("Post response missing data field")
+                .map_err(RequestError::Fatal)
         })
         .await
     }
 
+    /// Post a reply. Intentionally NOT retried: if the server commits the reply
+    /// but the response is lost (timeout, dropped connection), retrying would
+    /// post a duplicate — the bot's cardinal sin. A single attempt is safer.
     pub async fn reply_to_post(
         &self,
         parent_post_id: u64,
         content: &str,
         entities: &[PostEntity],
     ) -> Result<u64> {
-        self.retry(|| async {
-            let form = self.build_reply_form(parent_post_id, content, entities);
+        let form = self.build_reply_form(parent_post_id, content, entities);
 
-            let url = format!("{}/posts", self.api_base);
-            let resp = self
-                .client
-                .post(&url)
-                .headers(self.auth_headers()?)
-                .header("Accept", "application/json")
-                .multipart(form)
-                .send()
-                .await
-                .context("Failed to send reply")?;
+        let url = format!("{}/posts", self.api_base);
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.auth_headers()?)
+            .header("Accept", "application/json")
+            .multipart(form)
+            .send()
+            .await
+            .context("Failed to send reply")?;
 
-            let status = resp.status();
-            let bytes = resp.bytes().await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await?;
 
-            if !status.is_success() {
-                let text = String::from_utf8_lossy(&bytes);
-                anyhow::bail!("Reply error (HTTP {status}): {text}");
-            }
+        if !status.is_success() {
+            return Err(http_error(status, "Reply error", &bytes).into());
+        }
 
-            let reply: ReplyResponse =
-                serde_json::from_slice(&bytes).context("Failed to parse reply response")?;
+        let reply: ReplyResponse =
+            serde_json::from_slice(&bytes).context("Failed to parse reply response")?;
 
-            reply
-                .id
-                .or(reply.post_id)
-                .or_else(|| reply.data.as_ref().and_then(|d| d.id.or(d.post_id)))
-                .ok_or_else(|| anyhow::anyhow!("Reply response missing post ID"))
-        })
-        .await
+        reply
+            .id
+            .or(reply.post_id)
+            .or_else(|| reply.data.as_ref().and_then(|d| d.id.or(d.post_id)))
+            .ok_or_else(|| anyhow::anyhow!("Reply response missing post ID"))
     }
 
     pub async fn mark_notifications_read(&self, ids: &[u64]) -> Result<()> {
@@ -255,18 +323,20 @@ impl ThingsClient {
             let resp = self
                 .client
                 .post(&url)
-                .headers(self.auth_headers()?)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
                 .await
-                .context("Failed to mark notifications as read")?;
+                .map_err(transport_error("Failed to mark notifications as read"))?;
 
             let status = resp.status();
             if !status.is_success() {
-                let bytes = resp.bytes().await?;
-                let text = String::from_utf8_lossy(&bytes);
-                anyhow::bail!("Mark read error (HTTP {status}): {text}");
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(transport_error("Failed to read mark-read response"))?;
+                return Err(http_error(status, "Mark read error", &bytes));
             }
 
             Ok(())
@@ -284,6 +354,9 @@ impl ThingsClient {
             .context("Failed to download media")?;
 
         let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(AuthExpired.into());
+        }
         if !status.is_success() {
             anyhow::bail!("Media download error (HTTP {status}) for {url}");
         }
@@ -346,16 +419,21 @@ impl ThingsClient {
         form
     }
 
+    /// Retry only failures that can heal (transport errors, 429, 5xx).
+    /// Fatal 4xx and 401s return immediately.
     async fn retry<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: std::future::Future<Output = Result<T, RequestError>>,
     {
         let mut last_error = None;
         for attempt in 1..=MAX_RETRIES {
             match operation().await {
                 Ok(val) => return Ok(val),
-                Err(e) => {
+                Err(e @ RequestError::AuthExpired) | Err(e @ RequestError::Fatal(_)) => {
+                    return Err(e.into())
+                }
+                Err(RequestError::Retryable(e)) => {
                     warn!("Request failed (attempt {attempt}/{MAX_RETRIES}): {e}");
                     last_error = Some(e);
                     if attempt < MAX_RETRIES {

@@ -1,3 +1,5 @@
+mod admin;
+mod config;
 mod entities;
 mod gemini_client;
 mod models;
@@ -5,56 +7,112 @@ mod qdrant_client;
 mod qdrant_models;
 mod things_client;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+use crate::config::RuntimeConfig;
 use crate::entities::build_reply_with_entities;
-use crate::gemini_client::GeminiClient;
+use crate::gemini_client::{GeminiClient, GeminiError};
 use crate::models::{Notification, Post};
 use crate::qdrant_client::{MemoryWrite, QdrantClient};
-use crate::qdrant_models::{MemoryEntry, MessagePayload, MessageType, SearchOptions};
-use crate::things_client::ThingsClient;
+use crate::qdrant_models::{
+    app_fact_point_id, user_fact_point_id, AppFactPayload, AppFactSource, AppFactStatus,
+    AppKnowledgeSeed, FactCategory, MemoryEntry, MessagePayload, MessageType, UserFactPayload,
+    PROCESSED_COLLECTION_NAME, THINGS_KNOWLEDGE_COLLECTION_NAME, USER_PROFILES_COLLECTION_NAME,
+};
+use crate::things_client::{is_auth_expired, ThingsClient, TOKEN_FILE};
 
 const BOT_USERNAME: &str = "AskMe";
 const POLL_INTERVAL_MS: u64 = 3_000;
 const MAX_RESPONSE_LENGTH: usize = 500;
 const MAX_CONTEXT_DEPTH: usize = 20;
 const MAX_MEDIA_FILES: usize = 5;
-const PROCESSED_IDS_FILE: &str = ".processed-ids.json";
 const MEMORY_WRITE_BATCH_SIZE: usize = 5;
 const MEMORY_WRITE_FLUSH_MS: u64 = 2_000;
+/// Notification pages fetched per poll (until all unread are covered).
+const MAX_NOTIFICATION_PAGES: u32 = 5;
+/// How often a notification may fail before it is poison-marked and skipped.
+const MAX_PROCESS_ATTEMPTS: u8 = 3;
+/// Polls with an unchanged unread count before a stuck count is called out.
+const STAGNANT_WARN_CYCLES: u32 = 20;
+/// Timeout for the final memory-writer flush on shutdown.
+const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 10;
+/// Curated Things-app knowledge seeded into tier-3 memory on every boot.
+const APP_KNOWLEDGE_SEED_FILE: &str = "things_knowledge.json";
+/// Facts longer than this are almost certainly extraction noise.
+const MAX_FACT_LENGTH: usize = 300;
+/// Questions shorter than this never trigger app-knowledge retrieval: a
+/// one-word question ("Hi", "Thanks") has diffuse semantics and matches
+/// everything, while a genuine app question always names the app.
+const MIN_APP_KNOWLEDGE_QUESTION_CHARS: usize = 12;
+
+/// A user message queued for the background fact-extraction pass.
+struct ExtractionJob {
+    username: String,
+    /// The user's message text (mention already stripped).
+    text: String,
+    post_id: u64,
+    conversation_id: u64,
+}
 
 struct AppState {
     things: ThingsClient,
     gemini: GeminiClient,
     qdrant: Arc<QdrantClient>,
     memory_writer: mpsc::UnboundedSender<MemoryWrite>,
+    extraction_writer: mpsc::UnboundedSender<ExtractionJob>,
+    /// Live, hot-reloadable configuration (panel saves swap it atomically).
+    runtime: Arc<RwLock<RuntimeConfig>>,
     system_prompt: String,
     /// In-memory mirror of processed notification ids (session-only safety net;
     /// Qdrant is the source of truth for cross-restart dedup).
     processed: HashSet<u64>,
-    context_depth_limit: usize,
+    /// Per-notification failure counters for the current session.
+    failures: HashMap<u64, u8>,
+}
+
+/// Result of attempting to handle one notification.
+enum ProcessOutcome {
+    /// A reply was generated and posted.
+    Replied,
+    /// Deliberately ignored (no post, bot's own post, empty question, ...).
+    Skipped,
+    /// Something transient failed; worth retrying on the next poll.
+    Failed,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    let log_buffer = admin::new_log_buffer();
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(admin::LogLayer::new(log_buffer.clone()))
         .init();
 
     dotenvy::dotenv().ok();
 
-    let gemini_api_key =
-        std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set in .env");
+    // Layered config: bot_config.json overrides > .env > defaults. Also
+    // ensures the admin password hash exists (default CHANGEME on first boot).
+    let mut bot_config = config::load();
+    if let Err(e) = config::ensure_password_hash(&mut bot_config) {
+        warn!("Failed to initialize admin password: {e}");
+    }
+    let bot_config = Arc::new(RwLock::new(bot_config));
+
+    let gemini_api_keys = config::resolve_gemini_keys(&bot_config.read().await.overrides);
+    if gemini_api_keys.is_empty() {
+        error!("No Gemini API keys configured (bot_config.json or GEMINI_API_KEY(S) env)");
+        std::process::exit(1);
+    }
     let things_email = std::env::var("THINGS_EMAIL").expect("THINGS_EMAIL must be set in .env");
     let things_password =
         std::env::var("THINGS_PASSWORD").expect("THINGS_PASSWORD must be set in .env");
@@ -75,38 +133,113 @@ async fn main() -> Result<()> {
 
     info!("Authentication successful. Starting bot...");
 
-    let gemini = GeminiClient::new(gemini_api_key);
+    let args: Vec<String> = std::env::args().collect();
 
-    let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6334".to_string());
-    let embedding_dimensions: u64 = std::env::var("EMBEDDING_DIMENSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
-    let context_search_limit: u64 = std::env::var("CONTEXT_SEARCH_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-    let context_depth_limit: usize = std::env::var("CONTEXT_DEPTH_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_CONTEXT_DEPTH);
+    let (generation_model, thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
+        let cfg = bot_config.read().await;
+        (
+            config::resolve_generation_model(&cfg.overrides),
+            config::resolve_thinking_level(&cfg.overrides),
+            config::resolve_embedding_model(&cfg.overrides),
+            config::resolve_embedding_dimensions(&cfg.overrides),
+            config::resolve_qdrant_url(&cfg.overrides),
+        )
+    };
+    let gemini = GeminiClient::with_keys(
+        gemini_api_keys,
+        generation_model,
+        thinking_level,
+        embedding_model.clone(),
+        embedding_dimensions as u32,
+    );
 
-    let qdrant = QdrantClient::connect(
-        &qdrant_url,
-        Arc::new(gemini.clone()),
-        embedding_dimensions,
-        context_search_limit,
-    )
-    .await;
+    let runtime_config = Arc::new(RwLock::new(RuntimeConfig::resolve(
+        &bot_config.read().await.overrides,
+    )));
+
+    let qdrant = QdrantClient::connect(&qdrant_url, Arc::new(gemini.clone()), embedding_dimensions)
+        .await;
     let qdrant = Arc::new(qdrant);
 
+    // Embedding-model migration: vectors of different models are incompatible
+    // even at the same dimension, so a model change wipes the vector memory
+    // (processed markers kept; app knowledge re-seeds below; user profiles
+    // rebuild organically). A missing marker means pre-migration data, which
+    // was embedded with LEGACY_EMBEDDING_MODEL.
     if qdrant.is_available() {
-        match qdrant.ensure_collection().await {
-            Ok(()) => info!("Qdrant collection ready: {}", qdrant.collection_name()),
-            Err(e) => warn!(
-                "Qdrant reachable but collection setup failed: {e}; degrading to memory-only mode"
-            ),
+        let last_model = bot_config
+            .read()
+            .await
+            .state
+            .last_embedding_model
+            .clone()
+            .unwrap_or_else(|| config::LEGACY_EMBEDDING_MODEL.to_string());
+        if last_model != embedding_model {
+            warn!(
+                "Embedding model changed {last_model} -> {embedding_model}: \
+                 wiping vector memory (incompatible embeddings)"
+            );
+            match qdrant.reset_memory().await {
+                Ok(()) => {
+                    let mut cfg = bot_config.write().await;
+                    // Old thresholds were tuned for the previous model — fall
+                    // back to the defaults tuned for the new one.
+                    cfg.overrides.user_fact_supersede_threshold = None;
+                    cfg.overrides.forget_similarity_threshold = None;
+                    cfg.state.last_embedding_model = Some(embedding_model.clone());
+                    if let Err(e) = config::save(&cfg) {
+                        warn!("Failed to save config after embedding migration: {e}");
+                    }
+                    *runtime_config.write().await = RuntimeConfig::resolve(&cfg.overrides);
+                    info!("Embedding migration complete: memory wiped, thresholds reset");
+                }
+                Err(e) => error!("Embedding migration wipe failed: {e}"),
+            }
+        } else if bot_config.read().await.state.last_embedding_model.is_none() {
+            // First boot with tracking enabled: just record the marker.
+            let mut cfg = bot_config.write().await;
+            cfg.state.last_embedding_model = Some(embedding_model.clone());
+            if let Err(e) = config::save(&cfg) {
+                warn!("Failed to record embedding model marker: {e}");
+            }
+        }
+    }
+
+    // Ops mode: wipe the three memory collections (processed-notification
+    // markers are kept) and exit. Run this once when switching schemas.
+    if args.iter().any(|a| a == "--reset-memory") {
+        if !qdrant.is_available() {
+            error!("--reset-memory requires a reachable Qdrant at {qdrant_url}");
+            std::process::exit(1);
+        }
+        return match qdrant.reset_memory().await {
+            Ok(()) => {
+                info!("Memory reset complete; processed-notification markers kept. Start the bot normally.");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Memory reset failed: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    if qdrant.is_available() {
+        // Collection setup failures (e.g. vector-dimension mismatch) are
+        // configuration errors: fail loudly instead of running degraded.
+        if let Err(e) = qdrant.ensure_collections().await {
+            error!("Qdrant collection setup failed: {e}");
+            std::process::exit(1);
+        }
+        info!(
+            "Qdrant collections ready: {}, {}, {}, {}",
+            qdrant.collection_name(),
+            PROCESSED_COLLECTION_NAME,
+            USER_PROFILES_COLLECTION_NAME,
+            THINGS_KNOWLEDGE_COLLECTION_NAME
+        );
+        if let Err(e) = seed_app_knowledge(&qdrant).await {
+            warn!("Failed to seed Things app knowledge: {e}");
         }
     }
 
@@ -115,25 +248,24 @@ async fn main() -> Result<()> {
         MEMORY_WRITE_BATCH_SIZE,
         Duration::from_millis(MEMORY_WRITE_FLUSH_MS),
     );
+    let extraction_writer =
+        spawn_extraction_worker(gemini.clone(), qdrant.clone(), runtime_config.clone());
 
     let state = Arc::new(RwLock::new(AppState {
         things,
         gemini,
         qdrant,
         memory_writer,
+        extraction_writer,
+        runtime: runtime_config,
         system_prompt,
         processed,
-        context_depth_limit,
+        failures: HashMap::new(),
     }));
 
-    let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--test-post") {
-        let post_id = args
-            .iter()
-            .rev()
-            .find(|a| !a.starts_with("--"))
-            .ok_or_else(|| anyhow::anyhow!("--test-post requires a post id"))?
-            .parse::<u64>()?;
+        let post_id = parse_test_post_id(&args)
+            .ok_or_else(|| anyhow::anyhow!("--test-post requires a numeric post id"))?;
         let do_post = args.iter().any(|a| a == "--post");
         let prompt_override = args
             .iter()
@@ -141,6 +273,39 @@ async fn main() -> Result<()> {
             .and_then(|p| args.get(p + 1))
             .cloned();
         return test_post(&state, post_id, do_post, prompt_override.as_deref()).await;
+    }
+
+    // Bot mode only (never in --test-post): on the very first boot, silently
+    // mark the existing notification backlog as processed instead of replying
+    // to every historical mention.
+    seed_existing_notifications(&state).await;
+
+    // Admin panel: bind, announce, and serve in the background. Non-fatal if
+    // the port is taken — the bot works fine without the panel.
+    {
+        let (bind, port) = {
+            let cfg = bot_config.read().await;
+            (cfg.admin.bind.clone(), cfg.admin.port)
+        };
+        let addr = format!("{bind}:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let lan_ip = local_ip_address::local_ip().ok();
+                info!("Admin panel: http://localhost:{port}");
+                println!("Admin panel: http://localhost:{port}");
+                if let Some(ip) = lan_ip {
+                    info!("Admin panel (LAN): http://{ip}:{port}");
+                    println!("Admin panel (LAN): http://{ip}:{port}");
+                }
+                let admin_state = admin::AdminState::new(state.clone(), bot_config, log_buffer);
+                tokio::spawn(async move {
+                    if let Err(e) = admin::serve(listener, admin_state).await {
+                        error!("Admin panel server failed: {e}");
+                    }
+                });
+            }
+            Err(e) => warn!("Admin panel disabled: failed to bind {addr}: {e}"),
+        }
     }
 
     let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -155,7 +320,24 @@ async fn main() -> Result<()> {
     wait_for_shutdown(&mut shutdown_rx).await;
 
     info!("Shutting down...");
+    // Flush any queued memory writes before exiting.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if state
+        .read()
+        .await
+        .memory_writer
+        .send(MemoryWrite::Flush(ack_tx))
+        .is_ok()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS), ack_rx).await;
+    }
     Ok(())
+}
+
+/// Extract the post id that must follow `--test-post` on the command line.
+fn parse_test_post_id(args: &[String]) -> Option<u64> {
+    let pos = args.iter().position(|a| a == "--test-post")?;
+    args.get(pos + 1)?.parse::<u64>().ok()
 }
 
 async fn test_post(
@@ -184,63 +366,95 @@ async fn test_post(
     }
 
     let question = extract_question(post);
+    let is_follow_up = post.parent_id.is_some()
+        && post_data
+            .parent
+            .as_ref()
+            .map(|p| p.author_username().eq_ignore_ascii_case(BOT_USERNAME))
+            .unwrap_or(false);
+    let (conversation_id, ancestors) =
+        resolve_conversation(state, &post_data, post, is_follow_up).await;
+
+    if !ancestors.is_empty() {
+        println!("=== Ancestor chain ({} posts above) ===", ancestors.len());
+        for (author, content) in &ancestors {
+            println!("  {}: {}", author, truncate_text(content, 120));
+        }
+    }
 
     let qdrant = state.read().await.qdrant.clone();
     println!("=== Qdrant status ===");
     if qdrant.is_available() {
         println!("Connected (collection: {})", qdrant.collection_name());
 
-        let thread_id = resolve_thread(state, &post_data, post).await;
         let payload = MessagePayload {
             id: post_id,
-            content: post.content_text().to_string(),
+            content: strip_mention(post.content_text()),
             username: post.author_username().to_string(),
-            message_type: MessageType::Post,
+            message_type: if is_follow_up {
+                MessageType::Reply
+            } else {
+                MessageType::Post
+            },
             parent_id: post.parent_id,
-            thread_id,
+            conversation_id,
             timestamp: timestamp_from_post(post),
-            is_processed: false,
             media_urls: media_urls.clone(),
         };
         match qdrant.upsert(&payload).await {
-            Ok(()) => println!("Stored post {post_id} in Qdrant (thread {thread_id})"),
+            Ok(()) => println!("Stored post {post_id} in Qdrant (conversation {conversation_id})"),
             Err(e) => println!("Failed to store post {post_id} in Qdrant: {e}"),
         }
 
-        let depth_limit = state.read().await.context_depth_limit;
-        let thread = qdrant
-            .get_thread_context(thread_id, depth_limit as u64)
+        let depth_limit = {
+            let runtime = state.read().await.runtime.clone();
+            let cfg = runtime.read().await;
+            cfg.context_depth_limit
+        };
+        let conversation = qdrant
+            .get_conversation_context(conversation_id, depth_limit as u64)
             .await
             .unwrap_or_default();
         println!(
-            "=== Qdrant thread context (thread {thread_id}, {} entries) ===",
-            thread.len()
+            "=== Qdrant conversation context (conversation {conversation_id}, {} entries) ===",
+            conversation.len()
         );
-        for entry in &thread {
+        for entry in &conversation {
             println!(
                 "  [{}] {}: {}",
                 entry.timestamp, entry.username, entry.content
             );
         }
 
-        let related = qdrant
-            .search_context(
-                &question,
-                &SearchOptions {
-                    username: None,
-                    min_timestamp: None,
-                    limit: context_search_limit(),
-                },
+        let (facts_limit, app_limit, app_min_score) = {
+            let runtime = state.read().await.runtime.clone();
+            let cfg = runtime.read().await;
+            (
+                cfg.memory.user_facts_limit,
+                cfg.memory.app_knowledge_limit,
+                cfg.memory.app_knowledge_min_score,
             )
+        };
+        let facts = qdrant
+            .list_user_facts(post.author_username(), facts_limit)
             .await
             .unwrap_or_default();
-        println!("=== Qdrant semantic search ({} hits) ===", related.len());
-        for entry in related.iter().take(10) {
-            println!(
-                "  {}: {}",
-                entry.username,
-                truncate_text(&entry.content, 120)
-            );
+        println!(
+            "=== Qdrant user facts for {} ({} active) ===",
+            post.author_username(),
+            facts.len()
+        );
+        for (_, fact) in &facts {
+            println!("  - {}", fact.fact);
+        }
+
+        let app_hits = qdrant
+            .search_app_knowledge(&question, app_min_score, app_limit)
+            .await
+            .unwrap_or_default();
+        println!("=== Qdrant app knowledge ({} hits) ===", app_hits.len());
+        for fact in &app_hits {
+            println!("  - {}", fact.fact);
         }
     } else {
         println!("UNREACHABLE — running degraded (no persistent memory)");
@@ -249,17 +463,17 @@ async fn test_post(
     let gemini = state.read().await.gemini.clone();
     let system_prompt = state.read().await.system_prompt.clone();
 
-    let mut file_uris: Vec<(String, String)> = Vec::new();
+    let mut media_files: Vec<DownloadedMedia> = Vec::new();
     if !media_urls.is_empty() {
-        println!("=== Downloading + uploading media ===");
+        println!("=== Downloading media ===");
         for url in &media_urls {
-            match download_and_upload_media(state, &gemini, url).await {
-                Ok((uri, mime)) => {
-                    println!("Uploaded: {uri} ({mime})");
-                    file_uris.push((uri, mime));
+            match download_media_file(state, url).await {
+                Ok(file) => {
+                    println!("Downloaded {} bytes ({})", file.data.len(), file.mime);
+                    media_files.push(file);
                 }
                 Err(e) => {
-                    println!("Media processing failed for {url}: {e}");
+                    println!("Media download failed for {url}: {e}");
                 }
             }
         }
@@ -268,28 +482,22 @@ async fn test_post(
     let user_text = match prompt_override {
         Some(custom) => custom.to_string(),
         None => {
-            let is_follow_up = post.parent_id.is_some()
-                && post_data
-                    .parent
-                    .as_ref()
-                    .map(|p| p.author_username().eq_ignore_ascii_case(BOT_USERNAME))
-                    .unwrap_or(false);
             if is_follow_up {
                 println!("=== Follow-up reply (parent is {BOT_USERNAME}) ===");
-                let thread_id = resolve_thread(state, &post_data, post).await;
-                build_follow_up_prompt(state, post, &question, &post_data, thread_id).await
+                build_follow_up_prompt(state, post, &question, &post_data, conversation_id).await
             } else {
-                build_mention_prompt(&post_data, post, &question)
+                build_mention_prompt(state, post, &question, &ancestors).await
             }
         }
     };
     println!("=== Prompt ===");
     println!("{user_text}");
 
-    println!("=== Generating response ===");
-    let response = gemini
-        .generate_content(&system_prompt, &user_text, &file_uris)
-        .await?;
+    println!(
+        "=== Generating response (key pool: {} keys) ===",
+        gemini.pool_size()
+    );
+    let response = generate_with_failover(&gemini, &system_prompt, &user_text, &media_files).await?;
 
     println!("=== Raw response ===");
     println!("{response}");
@@ -336,8 +544,21 @@ async fn wait_for_shutdown(_rx: &mut mpsc::Receiver<()>) {
     info!("Received Ctrl+C signal");
 }
 
-/// Seed the processed-notification cache from Qdrant (and migrate the legacy
-/// JSON file on first startup).
+/// Exit the process when the Things token has expired: the bot cannot recover
+/// on its own (login needs an interactive OTP), so fail loudly — after
+/// removing the stale token file — instead of error-looping forever.
+fn exit_if_auth_expired(err: &anyhow::Error) {
+    if is_auth_expired(err) {
+        error!(
+            "Things auth token expired (HTTP 401). Deleting stale {TOKEN_FILE}; \
+             restart the bot and complete the OTP login again."
+        );
+        let _ = std::fs::remove_file(TOKEN_FILE);
+        std::process::exit(2);
+    }
+}
+
+/// Seed the processed-notification cache from Qdrant.
 async fn load_processed_ids(qdrant: &Arc<QdrantClient>) -> HashSet<u64> {
     let mut ids = HashSet::new();
 
@@ -354,64 +575,100 @@ async fn load_processed_ids(qdrant: &Arc<QdrantClient>) -> HashSet<u64> {
         }
     }
 
-    match std::fs::read_to_string(PROCESSED_IDS_FILE) {
-        Ok(content) => match serde_json::from_str::<Vec<u64>>(&content) {
-            Ok(list) if !list.is_empty() => {
-                if qdrant.is_available() {
-                    let mut migrated = 0;
-                    let mut failures = Vec::new();
-                    for id in &list {
-                        if ids.contains(id) {
-                            continue;
-                        }
-                        match qdrant.mark_processed(*id).await {
-                            Ok(()) => {
-                                ids.insert(*id);
-                                migrated += 1;
-                            }
-                            Err(e) => {
-                                warn!("Failed to migrate processed ID {id}: {e}");
-                                failures.push(*id);
-                            }
-                        }
-                    }
-                    info!("Migrated {migrated} processed IDs from legacy file into Qdrant");
-                    if failures.is_empty() {
-                        match std::fs::remove_file(PROCESSED_IDS_FILE) {
-                            Ok(()) => info!("Removed legacy {PROCESSED_IDS_FILE}"),
-                            Err(e) => warn!("Failed to remove legacy {PROCESSED_IDS_FILE}: {e}"),
-                        }
-                    } else {
-                        warn!(
-                        "{} processed IDs failed to migrate (e.g. {:?}); keeping {PROCESSED_IDS_FILE} for retry on next boot",
-                        failures.len(),
-                        &failures[..failures.len().min(5)],
-                    );
-                    }
-                } else {
-                    for id in list {
-                        ids.insert(id);
-                    }
-                    info!(
-                        "Loaded {} processed notification IDs from legacy file (degraded mode)",
-                        ids.len()
-                    );
+    ids
+}
+
+/// On the very first boot (no processed markers anywhere), mark every
+/// currently-listed notification as processed WITHOUT replying, so the bot
+/// only answers mentions that arrive after startup.
+async fn seed_existing_notifications(state: &RwLock<AppState>) {
+    let (qdrant, already_have_ids) = {
+        let s = state.read().await;
+        (s.qdrant.clone(), !s.processed.is_empty())
+    };
+    if already_have_ids || !qdrant.is_available() {
+        return;
+    }
+
+    let mut ids: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for page in 1..=MAX_NOTIFICATION_PAGES {
+        let batch = {
+            let things = &state.read().await.things;
+            match things.get_notifications(page).await {
+                Ok(b) => b,
+                Err(e) => {
+                    exit_if_auth_expired(&e);
+                    warn!("Failed to fetch notifications for seeding (page {page}): {e}");
+                    break;
                 }
             }
-            Ok(_) => {}
-            Err(e) => warn!("Failed to parse {PROCESSED_IDS_FILE}: {e}"),
-        },
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Failed to read {PROCESSED_IDS_FILE}: {e}");
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for n in batch {
+            if seen.insert(n.id) {
+                ids.push(n.id);
             }
         }
     }
 
-    ids
+    if ids.is_empty() {
+        return;
+    }
+
+    match qdrant.mark_processed_many(&ids).await {
+        Ok(()) => {
+            state.write().await.processed.extend(ids.iter().copied());
+            info!(
+                "First boot: seeded {} existing notifications as processed; \
+                 only mentions arriving from now on will be answered",
+                ids.len()
+            );
+        }
+        Err(e) => warn!("Failed to seed existing notifications: {e}"),
+    }
+}
+
+/// Fetch notification pages until every unread notification has been seen (or
+/// the pages run out), so unread items buried past page 1 are never missed.
+async fn collect_notifications(
+    state: &RwLock<AppState>,
+    unread_count: u64,
+) -> Result<Vec<Notification>> {
+    let mut all: Vec<Notification> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut unread_seen: u64 = 0;
+
+    for page in 1..=MAX_NOTIFICATION_PAGES {
+        let batch = {
+            let things = &state.read().await.things;
+            things.get_notifications(page).await?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for notification in batch {
+            if !seen.insert(notification.id) {
+                continue;
+            }
+            if notification.is_read != Some(true) {
+                unread_seen += 1;
+            }
+            all.push(notification);
+        }
+        if unread_seen >= unread_count {
+            break;
+        }
+    }
+
+    Ok(all)
 }
 
 async fn poll_loop(state: Arc<RwLock<AppState>>) {
+    let mut stagnant: Option<(u64, u32)> = None;
+
     loop {
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
 
@@ -420,6 +677,7 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
             match things.get_unread_count().await {
                 Ok(count) => count,
                 Err(e) => {
+                    exit_if_auth_expired(&e);
                     error!("Failed to get unread count: {e}");
                     continue;
                 }
@@ -427,24 +685,43 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
         };
 
         if unread_count == 0 {
+            stagnant = None;
             continue;
         }
 
-        info!("{unread_count} unread notifications");
+        // A count that never changes means the unread notifications are not
+        // visible in the fetched pages (deleted posts, server-side quirks).
+        // Warn once, then stay quiet instead of spamming the log every poll.
+        match &mut stagnant {
+            Some((count, cycles)) if *count == unread_count => *cycles += 1,
+            _ => stagnant = Some((unread_count, 0)),
+        }
+        let stagnant_cycles = stagnant.map(|(_, c)| c).unwrap_or(0);
+        if stagnant_cycles == STAGNANT_WARN_CYCLES {
+            warn!(
+                "Unread notification count stuck at {unread_count} for ~{STAGNANT_WARN_CYCLES} \
+                 polls; the unread notifications are not visible in the fetched pages \
+                 (deleted posts?). Polling continues quietly."
+            );
+        }
+        if stagnant_cycles > STAGNANT_WARN_CYCLES {
+            debug!("{unread_count} unread notifications (count unchanged, nothing actionable)");
+        } else {
+            info!("{unread_count} unread notifications");
+        }
 
-        let notifications = {
-            let things = &state.read().await.things;
-            match things.get_notifications(1).await {
-                Ok(n) => n,
-                Err(e) => {
-                    error!("Failed to fetch notifications: {e}");
-                    continue;
-                }
+        let notifications = match collect_notifications(&state, unread_count).await {
+            Ok(n) => n,
+            Err(e) => {
+                exit_if_auth_expired(&e);
+                error!("Failed to fetch notifications: {e}");
+                continue;
             }
         };
 
         let mut to_process = Vec::new();
         let mut known_processed = Vec::new();
+        let mut irrelevant = Vec::new();
         {
             let state_read = state.read().await;
             for notification in &notifications {
@@ -461,42 +738,100 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
                     continue;
                 }
                 if is_mention_notification(notification)
-                    || is_follow_up_notification(&state, notification).await
+                    || is_follow_up_notification(&state_read, notification).await
                 {
                     to_process.push(notification.clone());
+                } else {
+                    irrelevant.push(notification.id);
                 }
             }
         }
-        if !known_processed.is_empty() {
-            state.write().await.processed.extend(known_processed);
-        }
-
-        if to_process.is_empty() {
-            continue;
-        }
-
-        info!("Processing {} notifications", to_process.len());
-
-        let mut handles = Vec::new();
-        for notification in to_process {
-            let state = state.clone();
-            let handle = tokio::spawn(async move {
-                process_notification(state, notification).await;
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            if let Err(e) = handle.await {
-                error!("Notification processing task failed: {e}");
-            }
-        }
-
-        let ids: Vec<u64> = notifications.iter().map(|n| n.id).collect();
         {
-            let things = &state.read().await.things;
-            if let Err(e) = things.mark_notifications_read(&ids).await {
-                error!("Failed to mark notifications as read: {e}");
+            let mut state_write = state.write().await;
+            state_write.processed.extend(known_processed);
+            // Irrelevant notifications (likes, follows, replies to other
+            // people's posts) are cached session-locally so they are not
+            // re-classified on every poll.
+            state_write.processed.extend(irrelevant);
+        }
+
+        if !to_process.is_empty() {
+            info!("Processing {} notifications", to_process.len());
+
+            let mut handles = Vec::new();
+            for notification in to_process {
+                let state = state.clone();
+                let handle = tokio::spawn(async move {
+                    let id = notification.id;
+                    let outcome = process_notification(state, notification).await;
+                    (id, outcome)
+                });
+                handles.push(handle);
+            }
+
+            let mut retry_later: HashSet<u64> = HashSet::new();
+            for handle in handles {
+                match handle.await {
+                    Ok((id, ProcessOutcome::Replied)) | Ok((id, ProcessOutcome::Skipped)) => {
+                        state.write().await.failures.remove(&id);
+                    }
+                    Ok((id, ProcessOutcome::Failed)) => {
+                        let attempts = {
+                            let mut s = state.write().await;
+                            let n = s.failures.entry(id).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        if attempts >= MAX_PROCESS_ATTEMPTS {
+                            error!(
+                                "Notification {id} failed {attempts} times; \
+                                 marking it processed so it is not retried forever"
+                            );
+                            let qdrant = state.read().await.qdrant.clone();
+                            if let Err(e) = qdrant.mark_processed(id).await {
+                                warn!("Failed to poison-mark notification {id} in Qdrant: {e}");
+                            }
+                            let mut s = state.write().await;
+                            s.processed.insert(id);
+                            s.failures.remove(&id);
+                        } else {
+                            warn!(
+                                "Notification {id} failed (attempt {attempts}/{MAX_PROCESS_ATTEMPTS}); \
+                                 will retry on the next poll"
+                            );
+                            retry_later.insert(id);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Notification processing task failed: {e}");
+                    }
+                }
+            }
+
+            // Mark read everything we saw EXCEPT failures that will be
+            // retried — those stay unread so the next poll picks them up.
+            let ids: Vec<u64> = notifications
+                .iter()
+                .map(|n| n.id)
+                .filter(|id| !retry_later.contains(id))
+                .collect();
+            if !ids.is_empty() {
+                let things = &state.read().await.things;
+                if let Err(e) = things.mark_notifications_read(&ids).await {
+                    exit_if_auth_expired(&e);
+                    error!("Failed to mark notifications as read: {e}");
+                }
+            }
+        } else {
+            // Nothing actionable: still drain the unread count for everything
+            // we saw (likes, follows, already-handled items, ...).
+            let ids: Vec<u64> = notifications.iter().map(|n| n.id).collect();
+            if !ids.is_empty() {
+                let things = &state.read().await.things;
+                if let Err(e) = things.mark_notifications_read(&ids).await {
+                    exit_if_auth_expired(&e);
+                    error!("Failed to mark notifications as read: {e}");
+                }
             }
         }
     }
@@ -510,7 +845,7 @@ fn is_mention_notification(notification: &Notification) -> bool {
 
 /// A follow-up is a reply to a post that AskMe itself wrote (detected from the
 /// notification payload, or from a `bot_reply` already persisted in Qdrant).
-async fn is_follow_up_notification(state: &RwLock<AppState>, notification: &Notification) -> bool {
+async fn is_follow_up_notification(state: &AppState, notification: &Notification) -> bool {
     let nt = notification.notification_type.as_deref().unwrap_or("");
     if nt != "post_reply" {
         return false;
@@ -521,24 +856,18 @@ async fn is_follow_up_notification(state: &RwLock<AppState>, notification: &Noti
     let Some(original_post_id) = original_post.id_value() else {
         return false;
     };
+    // Only the unique username is trusted — display names are user-controlled
+    // and anyone can call themselves "AskMe".
     let is_bot_author = original_post
         .user
         .as_ref()
-        .map(|u| {
-            u.username
-                .as_deref()
-                .unwrap_or("")
-                .eq_ignore_ascii_case(BOT_USERNAME)
-                || u.name
-                    .as_deref()
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case(BOT_USERNAME)
-        })
+        .and_then(|u| u.username.as_deref())
+        .map(|u| u.eq_ignore_ascii_case(BOT_USERNAME))
         .unwrap_or(false);
     if is_bot_author {
         return true;
     }
-    let qdrant = state.read().await.qdrant.clone();
+    let qdrant = state.qdrant.clone();
     if !qdrant.is_available() {
         return false;
     }
@@ -576,7 +905,21 @@ fn notification_post_id(notification: &Notification) -> Option<u64> {
         })
 }
 
-async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notification) {
+/// Mark a notification as deliberately skipped (local cache + Qdrant marker),
+/// so it is never re-evaluated, and report the outcome.
+async fn skip_notification(state: &Arc<RwLock<AppState>>, notification_id: u64) -> ProcessOutcome {
+    let qdrant = state.read().await.qdrant.clone();
+    if let Err(e) = qdrant.mark_processed(notification_id).await {
+        warn!("Failed to mark skipped notification {notification_id} in Qdrant: {e}");
+    }
+    state.write().await.processed.insert(notification_id);
+    ProcessOutcome::Skipped
+}
+
+async fn process_notification(
+    state: Arc<RwLock<AppState>>,
+    notification: Notification,
+) -> ProcessOutcome {
     let notification_id = notification.id;
 
     let post_id = match notification_post_id(&notification) {
@@ -586,8 +929,7 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
                 "Notification {} has no post data, skipping",
                 notification.id
             );
-            state.write().await.processed.insert(notification_id);
-            return;
+            return skip_notification(&state, notification_id).await;
         }
     };
 
@@ -596,8 +938,9 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
         match things.get_post(post_id).await {
             Ok(data) => data,
             Err(e) => {
+                exit_if_auth_expired(&e);
                 error!("Failed to fetch post {post_id}: {e}");
-                return;
+                return ProcessOutcome::Failed;
             }
         }
     };
@@ -606,24 +949,33 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
         Some(ref p) => p.clone(),
         None => {
             warn!("Post {post_id} has no content");
-            state.write().await.processed.insert(notification_id);
-            return;
+            return skip_notification(&state, notification_id).await;
         }
     };
 
-    let is_follow_up = is_follow_up_notification(&state, &notification).await;
-
-    let question = extract_question(&post);
-    if question.len() < 2 {
-        info!("Notification {notification_id}: question too short, skipping");
-        state.write().await.processed.insert(notification_id);
-        return;
+    // Never answer our own posts (defensive: prevents self-conversations if a
+    // notification ever points at one of the bot's replies).
+    if post.author_username().eq_ignore_ascii_case(BOT_USERNAME) {
+        info!("Notification {notification_id}: post authored by {BOT_USERNAME}, skipping");
+        return skip_notification(&state, notification_id).await;
     }
 
-    let thread_id = resolve_thread(&state, &post_data, &post).await;
+    let is_follow_up = {
+        let state_read = state.read().await;
+        is_follow_up_notification(&state_read, &notification).await
+    };
+
+    let question = extract_question(&post);
+    if question.chars().count() < 2 {
+        info!("Notification {notification_id}: question too short, skipping");
+        return skip_notification(&state, notification_id).await;
+    }
+
+    let (conversation_id, ancestors) =
+        resolve_conversation(&state, &post_data, &post, is_follow_up).await;
     let memory_payload = MessagePayload {
         id: post_id,
-        content: strip_mention(post.content_text()).to_string(),
+        content: strip_mention(post.content_text()),
         username: post.author_username().to_string(),
         message_type: if is_follow_up {
             MessageType::Reply
@@ -633,9 +985,8 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
         parent_id: post
             .parent_id
             .or_else(|| post_data.parent.as_ref().and_then(|p| p.id_value())),
-        thread_id,
+        conversation_id,
         timestamp: timestamp_from_post(&post),
-        is_processed: false,
         media_urls: extract_media_urls(&post),
     };
 
@@ -658,9 +1009,9 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
     }
 
     let user_text = if is_follow_up {
-        build_follow_up_prompt(&state, &post, &question, &post_data, thread_id).await
+        build_follow_up_prompt(&state, &post, &question, &post_data, conversation_id).await
     } else {
-        build_mention_prompt(&post_data, &post, &question)
+        build_mention_prompt(&state, &post, &question, &ancestors).await
     };
 
     info!(
@@ -669,27 +1020,24 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
     );
 
     let media_urls = extract_media_urls(&post);
-
-    let mut file_uris: Vec<(String, String)> = Vec::new();
-
     let gemini = state.read().await.gemini.clone();
+    let system_prompt = state.read().await.system_prompt.clone();
+
+    // Download media first (per-file tolerant). The reply flow then runs with
+    // a sticky API-key lease: on a 429 the key is cooled down, the next key is
+    // leased, and any media is re-uploaded into the new project.
+    let mut media_files: Vec<DownloadedMedia> = Vec::new();
     for url in &media_urls {
-        match download_and_upload_media(&state, &gemini, url).await {
-            Ok((uri, mime)) => {
-                info!("Media uploaded to Gemini: {uri} ({mime})");
-                file_uris.push((uri, mime));
-            }
+        match download_media_file(&state, url).await {
+            Ok(file) => media_files.push(file),
             Err(e) => {
-                warn!("Failed to process media {url} for notification {notification_id}: {e}");
+                exit_if_auth_expired(&e);
+                warn!("Failed to download media {url} for notification {notification_id}: {e}");
             }
         }
     }
 
-    let system_prompt = state.read().await.system_prompt.clone();
-
-    let response = gemini
-        .generate_content(&system_prompt, &user_text, &file_uris)
-        .await;
+    let response = generate_with_failover(&gemini, &system_prompt, &user_text, &media_files).await;
 
     let (reply_text, reply_entities) = match response {
         Ok(text) => {
@@ -703,102 +1051,174 @@ async fn process_notification(state: Arc<RwLock<AppState>>, notification: Notifi
         }
         Err(e) => {
             error!("Gemini generation failed for notification {notification_id}: {e}");
-            return;
+            return ProcessOutcome::Failed;
         }
     };
 
-    let reply_id = {
+    let reply_result = {
         let things = &state.read().await.things;
-        match things
+        things
             .reply_to_post(post_id, &reply_text, &reply_entities)
             .await
-        {
-            Ok(reply_id) => {
-                info!("Posted reply {reply_id} to post {post_id}");
-                Some(reply_id)
+    };
+
+    let reply_id = match reply_result {
+        Ok(reply_id) => {
+            info!("Posted reply {reply_id} to post {post_id}");
+            reply_id
+        }
+        Err(e) => {
+            exit_if_auth_expired(&e);
+            error!("Failed to post reply to {post_id}: {e}");
+            // Retry only when the request definitely never reached the server.
+            // Otherwise the reply may have been committed server-side and
+            // retrying would post a duplicate — worse than a lost retry.
+            let never_sent = e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .map(|re| re.is_connect())
+                    .unwrap_or(false)
+            });
+            if never_sent {
+                return ProcessOutcome::Failed;
             }
-            Err(e) => {
-                error!("Failed to post reply to {post_id}: {e}");
-                None
-            }
+            warn!(
+                "Not retrying reply for notification {notification_id} \
+                 (reply may already be committed); marking processed"
+            );
+            return skip_notification(&state, notification_id).await;
         }
     };
 
-    if let Some(reply_id) = reply_id {
-        let qdrant = state.read().await.qdrant.clone();
+    let qdrant = state.read().await.qdrant.clone();
 
-        let reply_payload = MessagePayload {
-            id: reply_id,
-            content: reply_text,
-            username: BOT_USERNAME.to_string(),
-            message_type: MessageType::BotReply,
-            parent_id: Some(post_id),
-            thread_id,
-            timestamp: unix_now(),
-            is_processed: true,
-            media_urls: Vec::new(),
-        };
-        if let Err(e) = qdrant.upsert(&reply_payload).await {
-            warn!("Failed to store bot reply {reply_id} in Qdrant: {e}");
-        }
-        if let Err(e) = qdrant.mark_processed(notification_id).await {
-            warn!("Failed to mark notification {notification_id} processed in Qdrant: {e}");
-        }
-        state.write().await.processed.insert(notification_id);
+    let reply_payload = MessagePayload {
+        id: reply_id,
+        content: reply_text,
+        username: BOT_USERNAME.to_string(),
+        message_type: MessageType::BotReply,
+        parent_id: Some(post_id),
+        conversation_id,
+        timestamp: unix_now(),
+        media_urls: Vec::new(),
+    };
+    if let Err(e) = qdrant.upsert(&reply_payload).await {
+        warn!("Failed to store bot reply {reply_id} in Qdrant: {e}");
     }
+    if let Err(e) = qdrant.mark_processed(notification_id).await {
+        warn!("Failed to mark notification {notification_id} processed in Qdrant: {e}");
+    }
+    state.write().await.processed.insert(notification_id);
+
+    // Long-term memory pass: pull durable user/app facts out of the user's
+    // message in the background. Idempotent, so retries are harmless.
+    let _ = state
+        .read()
+        .await
+        .extraction_writer
+        .send(ExtractionJob {
+            username: post.author_username().to_string(),
+            text: question.clone(),
+            post_id,
+            conversation_id,
+        });
+
+    ProcessOutcome::Replied
 }
 
 fn extract_question(post: &Post) -> String {
     strip_mention(post.content_text())
 }
 
+/// Remove every `@AskMe` mention from the content, keeping the surrounding
+/// text on both sides. ASCII-case-insensitive and char-boundary safe (a
+/// whole-string `to_lowercase()` would shift byte offsets for characters like
+/// Turkish `İ` and could slice mid-character — panicking or corrupting text).
 fn strip_mention(content: &str) -> String {
-    let pattern = format!("@{BOT_USERNAME}");
-    let lowered = content.to_lowercase();
-    let pattern_lower = pattern.to_lowercase();
+    const MENTION: &[u8] = b"@askme";
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut last = 0;
+    let mut i = 0;
 
-    if let Some(idx) = lowered.find(&pattern_lower) {
-        let after = &content[idx + pattern.len()..];
-        after.trim().to_string()
-    } else {
-        content.trim().to_string()
+    while i < bytes.len() {
+        // '@' is ASCII, so `i` is always a char boundary here.
+        if bytes[i] == b'@' {
+            let end = i + MENTION.len();
+            if end <= bytes.len()
+                && content.is_char_boundary(end)
+                && content[i..end].eq_ignore_ascii_case("@askme")
+            {
+                // Don't strip inside longer handles like "@AskMeBot".
+                let boundary_ok = match content[end..].chars().next() {
+                    None => true,
+                    Some(c) => !(c.is_ascii_alphanumeric() || c == '_'),
+                };
+                if boundary_ok {
+                    out.push_str(&content[last..i]);
+                    last = end;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
     }
+    out.push_str(&content[last..]);
+    collapse_spaces(&out)
+}
+
+/// Collapse runs of spaces/tabs (left behind by removed mentions) and trim.
+/// Newlines are preserved.
+fn collapse_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.chars() {
+        if c == ' ' || c == '\t' {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() && c != '\n' {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn extract_media_urls(post: &Post) -> Vec<String> {
-    let mut urls = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+
+    let mut push = |url: &String| {
+        if urls.len() < MAX_MEDIA_FILES && !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    };
 
     if let Some(ref media) = post.media {
         for item in media {
             if let Some(ref url) = item.url {
-                if urls.len() < MAX_MEDIA_FILES {
-                    urls.push(url.clone());
-                }
+                push(url);
             }
         }
     }
     if let Some(ref images) = post.images {
         for item in images {
             if let Some(ref url) = item.url {
-                if urls.len() < MAX_MEDIA_FILES {
-                    urls.push(url.clone());
-                }
+                push(url);
             }
         }
     }
     if let Some(ref attachment) = post.image {
         if let Some(ref url) = attachment.url {
-            if urls.len() < MAX_MEDIA_FILES {
-                urls.push(url.clone());
-            }
+            push(url);
         }
     }
     if let Some(ref attachments) = post.attachments {
         for item in attachments {
             if let Some(ref url) = item.url {
-                if urls.len() < MAX_MEDIA_FILES {
-                    urls.push(url.clone());
-                }
+                push(url);
             }
         }
     }
@@ -806,100 +1226,195 @@ fn extract_media_urls(post: &Post) -> Vec<String> {
     urls
 }
 
-fn build_mention_prompt(post_data: &models::PostData, post: &Post, question: &str) -> String {
+async fn build_mention_prompt(
+    state: &RwLock<AppState>,
+    post: &Post,
+    question: &str,
+    ancestors: &[(String, String)],
+) -> String {
     let author = post.author_username();
-    let parent_context = post_data
-        .parent
-        .as_ref()
-        .map(|p| {
-            let parent_author = p.author_username();
-            format!("\n[Original post by {parent_author}] {}", p.content_text())
-        })
-        .unwrap_or_default();
+    let depth_limit = {
+        let runtime = state.read().await.runtime.clone();
+        let cfg = runtime.read().await;
+        cfg.context_depth_limit
+    };
+    let above = format_ancestor_chain(ancestors, depth_limit);
+
+    let profile = build_user_profile_section(state, author).await;
+    let app_knowledge = build_app_knowledge_section(state, question).await;
 
     format!(
-        "[Post by {author}] {content}\n[Question] {question}{parent_context}",
+        "[Post by {author}] {content}\n[Question] {question}{above}{profile}{app_knowledge}",
         content = post.content_text(),
         question = question,
         author = author,
-        parent_context = parent_context,
+        above = above,
+        profile = profile,
+        app_knowledge = app_knowledge,
     )
 }
 
+/// Render the thread above a mention as prompt context, oldest first (the same
+/// shape as `[Conversation so far]` on the follow-up path). Keeps the newest
+/// `limit` entries when the chain is longer.
+fn format_ancestor_chain(ancestors: &[(String, String)], limit: usize) -> String {
+    if ancestors.is_empty() || limit == 0 {
+        return String::new();
+    }
+    let start = ancestors.len().saturating_sub(limit);
+    let mut section = String::from("\n[Conversation above]");
+    for (author, content) in &ancestors[start..] {
+        section.push_str(&format!("\n{author}: {content}"));
+    }
+    section
+}
+
+/// Tier 2 memory: durable facts about the user being replied to — the ONLY
+/// memory that crosses conversations, and always scoped to exactly that user.
+async fn build_user_profile_section(state: &RwLock<AppState>, author: &str) -> String {
+    if author.eq_ignore_ascii_case(BOT_USERNAME) {
+        return String::new();
+    }
+    let (qdrant, limit, enabled) = {
+        let s = state.read().await;
+        let runtime = s.runtime.clone();
+        let cfg = runtime.read().await;
+        (
+            s.qdrant.clone(),
+            cfg.memory.user_facts_limit,
+            cfg.memory.fact_extraction_enabled,
+        )
+    };
+    if !enabled || !qdrant.is_available() {
+        return String::new();
+    }
+    match qdrant.list_user_facts(author, limit).await {
+        Ok(facts) => format_user_profile_section(
+            author,
+            &facts.into_iter().map(|(_, f)| f).collect::<Vec<_>>(),
+        ),
+        Err(e) => {
+            warn!("Failed to load user facts for {author}: {e}");
+            String::new()
+        }
+    }
+}
+
+fn format_user_profile_section(author: &str, facts: &[UserFactPayload]) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    let mut section = format!("\n[About {author} — long-term memory]");
+    for fact in facts {
+        section.push_str(&format!("\n- {}", fact.fact));
+    }
+    section
+}
+
+/// Tier 3 memory: verified facts about the Things app, injected only when the
+/// question semantically matches them (score-gated), so unrelated
+/// conversations never see app knowledge.
+async fn build_app_knowledge_section(state: &RwLock<AppState>, question: &str) -> String {
+    let (qdrant, limit, min_score) = {
+        let s = state.read().await;
+        let runtime = s.runtime.clone();
+        let cfg = runtime.read().await;
+        (
+            s.qdrant.clone(),
+            cfg.memory.app_knowledge_limit,
+            cfg.memory.app_knowledge_min_score,
+        )
+    };
+    if !qdrant.is_available()
+        || question.trim().chars().count() < MIN_APP_KNOWLEDGE_QUESTION_CHARS
+    {
+        return String::new();
+    }
+    match qdrant.search_app_knowledge(question, min_score, limit).await {
+        Ok(facts) => format_app_knowledge_section(&facts),
+        Err(e) => {
+            warn!("Failed to search app knowledge: {e}");
+            String::new()
+        }
+    }
+}
+
+fn format_app_knowledge_section(facts: &[AppFactPayload]) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n[About Things — app knowledge]");
+    for fact in facts {
+        section.push_str(&format!("\n- {}", fact.fact));
+    }
+    section
+}
+
 /// Build the prompt for a follow-up question, pulling the conversation history
-/// from Qdrant (thread by id, augmented with semantic search) and falling back
-/// to the Things API only when memory is unavailable.
+/// from Qdrant (strictly scoped to this conversation) and falling back to the
+/// Things API only when memory is unavailable.
 async fn build_follow_up_prompt(
     state: &RwLock<AppState>,
     post: &Post,
     question: &str,
     post_data: &models::PostData,
-    thread_id: u64,
+    conversation_id: u64,
 ) -> String {
     let author = post.author_username();
+    let current_id = post.id_value();
     let qdrant = state.read().await.qdrant.clone();
-    let depth_limit = state.read().await.context_depth_limit;
+    let depth_limit = {
+        let runtime = state.read().await.runtime.clone();
+        let cfg = runtime.read().await;
+        cfg.context_depth_limit
+    };
 
     let mut context = String::new();
     let mut source = "things-api";
+    let mut entry_count = 0usize;
 
     if qdrant.is_available() {
-        let search_options = || SearchOptions {
-            username: None,
-            min_timestamp: None,
-            limit: context_search_limit(),
-        };
-
         match qdrant
-            .get_thread_context(thread_id, depth_limit as u64)
+            .get_conversation_context(conversation_id, depth_limit as u64)
             .await
         {
             Ok(mut entries) if !entries.is_empty() => {
                 source = "qdrant";
-                if entries.len() < 3 {
-                    if let Ok(related) = qdrant.search_context(question, &search_options()).await {
-                        for entry in related {
-                            if !entries.iter().any(|e| e.id == entry.id) {
-                                entries.push(entry);
-                            }
-                        }
-                        entries.sort_by_key(|e| e.timestamp);
-                        entries.truncate(depth_limit);
-                    }
-                }
+                // The current question was just persisted; don't echo it back
+                // inside its own context block.
+                entries.retain(|e| Some(e.id) != current_id);
+                entries.truncate(depth_limit);
+                entry_count = entries.len();
                 context = format_context_entries(&entries);
             }
-            Ok(_) => {
-                if let Ok(related) = qdrant.search_context(question, &search_options()).await {
-                    if !related.is_empty() {
-                        source = "qdrant-semantic";
-                        context = format_context_entries(&related);
-                    }
-                }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Qdrant conversation lookup failed for conversation {conversation_id}: {e}")
             }
-            Err(e) => warn!("Qdrant thread lookup failed for thread {thread_id}: {e}"),
         }
     }
 
     if context.is_empty() {
         let things = &state.read().await.things;
         context = build_thread_context(things, post_data.parent.as_ref()).await;
+        entry_count = context.matches('\n').count().saturating_sub(1);
     }
 
     info!(
-        "Follow-up context for thread {thread_id} from {source} ({} entries / {} chars)",
-        context
-            .matches("[Conversation so far]")
-            .count()
-            .saturating_add(0),
+        "Follow-up context for conversation {conversation_id} from {source} ({entry_count} entries / {} chars)",
         context.chars().count(),
     );
 
+    let profile = build_user_profile_section(state, author).await;
+    let app_knowledge = build_app_knowledge_section(state, question).await;
+
     format!(
-        "[Follow-up question by {author}] {question}{context}",
+        "[Follow-up question by {author}] {question}{context}{profile}{app_knowledge}",
         author = author,
         question = question,
         context = context,
+        profile = profile,
+        app_knowledge = app_knowledge,
     )
 }
 
@@ -956,91 +1471,374 @@ async fn build_thread_context(things: &ThingsClient, start_post: Option<&Post>) 
     chain
 }
 
-/// Determine the root post id of the thread a post belongs to.
+/// Determine the conversation a post belongs to.
 ///
-/// Reuses the thread id already stored for the parent point in Qdrant when
-/// possible; otherwise walks the parent chain through the Things API, backfilling
-/// every ancestor into memory as it goes.
-async fn resolve_thread(
+/// Isolation boundary: a conversation is rooted at the post where the bot was
+/// first @mentioned. Follow-ups (replies to the bot) inherit the conversation
+/// from their parent point; a fresh @mention ALWAYS starts a new conversation
+/// rooted at itself — even deep inside a bigger Things thread — so two
+/// mention-conversations never share context.
+async fn resolve_conversation(
     state: &RwLock<AppState>,
     post_data: &models::PostData,
     post: &Post,
-) -> u64 {
+    is_follow_up: bool,
+) -> (u64, Vec<(String, String)>) {
     let post_id = post.id_value().unwrap_or_default();
     let parent_id = post
         .parent_id
         .or_else(|| post_data.parent.as_ref().and_then(|p| p.id_value()));
 
-    match parent_id {
-        Some(parent_id) => {
+    if is_follow_up {
+        if let Some(parent_id) = parent_id {
             let qdrant = state.read().await.qdrant.clone();
             if qdrant.is_available() {
                 if let Ok(Some(entry)) = qdrant.get_point(parent_id).await {
-                    return entry.thread_id;
+                    // Follow-ups need no ancestor chain: the conversation
+                    // memory already holds the context.
+                    return (entry.conversation_id, Vec::new());
                 }
             }
-            walk_thread_root_and_backfill(state, parent_id).await
         }
-        None => post_id,
     }
+
+    // New mention (or unresolvable follow-up): a conversation of its own.
+    let chain = match parent_id {
+        Some(parent_id) => {
+            backfill_ancestors(state, post_data.parent.clone(), parent_id, post_id).await
+        }
+        None => Vec::new(),
+    };
+    (post_id, chain)
 }
 
-async fn walk_thread_root_and_backfill(state: &RwLock<AppState>, start_parent_id: u64) -> u64 {
-    let mut items: Vec<Post> = Vec::new();
+/// Store the ancestor chain above a fresh @mention as that conversation's
+/// lead-in context, and return it (oldest first) so the mention prompt can
+/// include the thread above.
+///
+/// Already-known posts are never re-stored (they belong to some other
+/// conversation, and backfill must not steal points from it) — but they still
+/// contribute to the RETURNED chain: the thread above a mention is legitimate
+/// context for the prompt regardless of which conversation stored it first.
+async fn backfill_ancestors(
+    state: &RwLock<AppState>,
+    seed_parent: Option<Post>,
+    start_parent_id: u64,
+    conversation_id: u64,
+) -> Vec<(String, String)> {
+    // Nearest-first during the walk; reversed at the end.
+    let mut chain: Vec<(String, String)> = Vec::new();
+    // The direct parent usually arrives with the notification payload — use it
+    // instead of re-fetching it from the Things API. It is a stand-in for
+    // `start_parent_id` ONLY: if the walk advances past the first step the
+    // seed must be discarded, never used as another ancestor.
+    let mut seed = seed_parent.filter(|p| p.id_value() == Some(start_parent_id));
+    let mut pending: Vec<MessagePayload> = Vec::new();
     let mut current_id = start_parent_id;
     let mut seen: HashSet<u64> = HashSet::new();
-    let mut root = start_parent_id;
     let mut depth = 0;
 
     while depth < MAX_CONTEXT_DEPTH {
         if !seen.insert(current_id) {
             break;
         }
-        let things = &state.read().await.things;
-        let Ok(data) = things.get_post(current_id).await else {
+
+        let qdrant = state.read().await.qdrant.clone();
+        if !qdrant.is_available() {
             break;
-        };
-        let Some(parent_post) = data.post.clone() else {
-            break;
-        };
-        items.push(parent_post.clone());
-        match parent_post.parent_id {
-            Some(next) => {
-                root = next;
-                current_id = next;
+        }
+
+        let next_id = match qdrant.get_point(current_id).await {
+            // Already stored (in ANY conversation): keep it out of our stores
+            // but in the prompt chain, and keep walking via its parent.
+            Ok(Some(entry)) => {
+                chain.push((entry.username.clone(), entry.content.clone()));
+                entry.parent_id
             }
+            Err(_) => break,
+            Ok(None) => {
+                let parent_post = match seed.take().filter(|_| current_id == start_parent_id) {
+                    Some(p) => p,
+                    None => {
+                        let things = &state.read().await.things;
+                        match things.get_post(current_id).await {
+                            Ok(data) => match data.post {
+                                Some(p) => p,
+                                None => break,
+                            },
+                            Err(_) => break,
+                        }
+                    }
+                };
+
+                chain.push((
+                    parent_post.author_username().to_string(),
+                    strip_mention(parent_post.content_text()),
+                ));
+
+                // Bot-authored ancestors keep their identity (the follow-up
+                // detector looks for BotReply points); the thread root (no
+                // parent) is a root post, not a reply.
+                let message_type = if parent_post
+                    .author_username()
+                    .eq_ignore_ascii_case(BOT_USERNAME)
+                {
+                    MessageType::BotReply
+                } else if parent_post.parent_id.is_none() {
+                    MessageType::Post
+                } else {
+                    MessageType::Reply
+                };
+                pending.push(MessagePayload {
+                    id: parent_post.id_value().unwrap_or_default(),
+                    content: strip_mention(parent_post.content_text()),
+                    username: parent_post.author_username().to_string(),
+                    message_type,
+                    parent_id: parent_post.parent_id,
+                    conversation_id,
+                    timestamp: timestamp_from_post(&parent_post),
+                    media_urls: extract_media_urls(&parent_post),
+                });
+
+                parent_post.parent_id
+            }
+        };
+
+        match next_id {
+            Some(next) => current_id = next,
             None => break,
         }
         depth += 1;
     }
 
-    let qdrant = state.read().await.qdrant.clone();
-    if qdrant.is_available() {
-        let writer = state.read().await.memory_writer.clone();
-        for parent_post in items {
-            let payload = MessagePayload {
-                id: parent_post.id_value().unwrap_or_default(),
-                content: strip_mention(parent_post.content_text()).to_string(),
-                username: parent_post.author_username().to_string(),
-                message_type: MessageType::Reply,
-                parent_id: parent_post.parent_id,
-                thread_id: root,
-                timestamp: timestamp_from_post(&parent_post),
-                is_processed: false,
-                media_urls: extract_media_urls(&parent_post),
-            };
-            let _ = writer.send(MemoryWrite::Upsert(payload));
+    // Persist synchronously (one batch embed) so freshly backfilled ancestors
+    // are immediately visible to the context builder that runs right after —
+    // e.g. a follow-up whose parent was not in memory.
+    if !pending.is_empty() {
+        let qdrant = state.read().await.qdrant.clone();
+        if let Err(e) = qdrant.upsert_many(&pending).await {
+            warn!(
+                "Failed to backfill {} ancestor posts into Qdrant: {e}",
+                pending.len()
+            );
         }
     }
 
-    root
+    chain.reverse();
+    chain
 }
 
-fn context_search_limit() -> u64 {
-    std::env::var("CONTEXT_SEARCH_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50)
+/// Upsert the curated `things_knowledge.json` seed facts into tier-3 memory.
+/// Idempotent (deterministic point ids); a missing file is not an error.
+async fn seed_app_knowledge(qdrant: &Arc<QdrantClient>) -> Result<()> {
+    let content = match std::fs::read_to_string(APP_KNOWLEDGE_SEED_FILE) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let seeds: Vec<AppKnowledgeSeed> = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {APP_KNOWLEDGE_SEED_FILE}: {e}"))?;
+    if seeds.is_empty() {
+        return Ok(());
+    }
+    let now = unix_now();
+    let items: Vec<(uuid::Uuid, AppFactPayload)> = seeds
+        .into_iter()
+        .map(|seed| {
+            let point_id = app_fact_point_id(&seed.fact);
+            let payload = AppFactPayload {
+                topic: seed.topic,
+                fact: seed.fact,
+                source: AppFactSource::Seed,
+                status: AppFactStatus::Active,
+                updated_at: now,
+            };
+            (point_id, payload)
+        })
+        .collect();
+    let count = items.len();
+    qdrant.upsert_app_facts(&items).await?;
+    info!("Seeded {count} app-knowledge facts from {APP_KNOWLEDGE_SEED_FILE}");
+    Ok(())
+}
+
+/// Spawn the background fact-extraction worker. For every answered user
+/// message it runs one lightweight Gemini call and turns the result into
+/// tier-2 (user facts) and tier-3 (pending app facts) memory writes.
+fn spawn_extraction_worker(
+    gemini: GeminiClient,
+    qdrant: Arc<QdrantClient>,
+    runtime: Arc<RwLock<RuntimeConfig>>,
+) -> mpsc::UnboundedSender<ExtractionJob> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ExtractionJob>();
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            // Snapshot the live config per job (panel edits apply immediately).
+            let config = runtime.read().await.memory.clone();
+            run_extraction_job(&gemini, &qdrant, &config, job).await;
+        }
+    });
+    tx
+}
+
+async fn run_extraction_job(
+    gemini: &GeminiClient,
+    qdrant: &Arc<QdrantClient>,
+    config: &config::MemoryConfig,
+    job: ExtractionJob,
+) {
+    if !config.fact_extraction_enabled
+        || !qdrant.is_available()
+        || job.username.eq_ignore_ascii_case(BOT_USERNAME)
+    {
+        return;
+    }
+
+    let extracted = match gemini.extract_facts(&job.username, &job.text).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Fact extraction failed for post {}: {e}", job.post_id);
+            return;
+        }
+    };
+    let now = unix_now();
+
+    // ── User facts: reinforce / supersede / insert ──
+    for fact in extracted.user_facts {
+        let text = fact.fact.trim();
+        if text.chars().count() < 3 || text.chars().count() > MAX_FACT_LENGTH {
+            continue;
+        }
+        let point_id = user_fact_point_id(&job.username, text);
+
+        // Exact restatement -> reinforce the existing point in place.
+        match qdrant.get_user_fact(point_id).await {
+            Ok(Some(existing)) => {
+                let patch = serde_json::json!({
+                    "last_seen": now,
+                    "times_confirmed": existing.times_confirmed.saturating_add(1),
+                    "active": true,
+                });
+                if let Err(e) = qdrant.patch_user_fact(point_id, patch).await {
+                    warn!("Failed to reinforce user fact {point_id}: {e}");
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Failed to check user fact {point_id}: {e}");
+                continue;
+            }
+        }
+
+        // Near-duplicate or contradiction -> retire the old fact, keep the new.
+        let vector = match qdrant.embed(text).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to embed user fact for {}: {e}", job.username);
+                continue;
+            }
+        };
+        match qdrant
+            .find_similar_user_fact(&job.username, &vector, config.user_fact_supersede_threshold)
+            .await
+        {
+            Ok(Some((old_id, old))) => {
+                let patch = serde_json::json!({
+                    "active": false,
+                    "superseded_by": point_id.to_string(),
+                });
+                if let Err(e) = qdrant.patch_user_fact(old_id, patch).await {
+                    warn!("Failed to supersede user fact {old_id}: {e}");
+                } else {
+                    info!(
+                        "Superseded fact about {}: '{}' -> '{}'",
+                        job.username, old.fact, text
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Similarity check failed for user fact: {e}"),
+        }
+
+        let payload = UserFactPayload {
+            username: job.username.clone(),
+            fact: text.to_string(),
+            category: fact
+                .category
+                .as_deref()
+                .and_then(FactCategory::parse)
+                .unwrap_or(FactCategory::Other),
+            source_post_id: job.post_id,
+            source_conversation_id: job.conversation_id,
+            first_seen: now,
+            last_seen: now,
+            times_confirmed: 1,
+            active: true,
+            superseded_by: None,
+        };
+        match qdrant.upsert_user_fact(point_id, &payload).await {
+            Ok(()) => info!("Learned fact about {}: {text}", job.username),
+            Err(e) => warn!("Failed to store user fact for {}: {e}", job.username),
+        }
+    }
+
+    // ── App facts: store as pending, never authoritative ──
+    for app_fact in extracted.app_facts {
+        let text = app_fact.fact.trim();
+        if text.chars().count() < 3 || text.chars().count() > MAX_FACT_LENGTH {
+            continue;
+        }
+        let point_id = app_fact_point_id(text);
+        match qdrant.get_app_fact(point_id).await {
+            // Already known — never demote a seeded/promoted fact back to pending.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let payload = AppFactPayload {
+                    topic: app_fact.topic.clone().unwrap_or_else(|| "general".to_string()),
+                    fact: text.to_string(),
+                    source: AppFactSource::User,
+                    status: AppFactStatus::Pending,
+                    updated_at: now,
+                };
+                match qdrant.upsert_app_facts(&[(point_id, payload)]).await {
+                    Ok(()) => info!("Stored pending app fact: {text}"),
+                    Err(e) => warn!("Failed to store app fact: {e}"),
+                }
+            }
+            Err(e) => warn!("Failed to check app fact {point_id}: {e}"),
+        }
+    }
+
+    // ── Forget requests: deactivate matching facts ──
+    for forget in extracted.forget {
+        let text = forget.trim();
+        if text.chars().count() < 3 {
+            continue;
+        }
+        let vector = match qdrant.embed(text).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to embed forget request for {}: {e}", job.username);
+                continue;
+            }
+        };
+        match qdrant
+            .search_user_facts_semantic(&job.username, &vector, config.forget_similarity_threshold, 3)
+            .await
+        {
+            Ok(matches) => {
+                for (id, fact) in matches {
+                    let patch = serde_json::json!({ "active": false, "last_seen": now });
+                    match qdrant.patch_user_fact(id, patch).await {
+                        Ok(()) => info!("Forgot fact about {}: '{}'", job.username, fact.fact),
+                        Err(e) => warn!("Failed to forget user fact {id}: {e}"),
+                    }
+                }
+            }
+            Err(e) => warn!("Forget search failed for {}: {e}", job.username),
+        }
+    }
 }
 
 fn unix_now() -> i64 {
@@ -1085,18 +1883,455 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     }
 }
 
-async fn download_and_upload_media(
-    state: &RwLock<AppState>,
-    gemini: &GeminiClient,
-    url: &str,
-) -> Result<(String, String)> {
-    let (data, mime_type) = {
+/// Media bytes downloaded from Things, staged for the reply flow's upload.
+struct DownloadedMedia {
+    data: Vec<u8>,
+    mime: String,
+    display_name: String,
+}
+
+async fn download_media_file(state: &RwLock<AppState>, url: &str) -> Result<DownloadedMedia> {
+    let (data, mime) = {
         let things = &state.read().await.things;
         things.download_media(url).await?
     };
+    Ok(DownloadedMedia {
+        data,
+        mime,
+        display_name: format!("media_{}", uuid::Uuid::new_v4()),
+    })
+}
 
-    let display_name = format!("media_{}", uuid::Uuid::new_v4());
-    let file_uri = gemini.upload_file(data, &mime_type, &display_name).await?;
+/// Run one reply generation flow with rate-limit failover across the key pool.
+///
+/// The flow uses a sticky key lease: media uploads and the generation that
+/// references them must live in the same Gemini project. On a 429 the lease
+/// key is cooled down, the next key is leased, and any media is RE-UPLOADED
+/// into the new project before retrying. On success the round-robin cursor
+/// advances past the flow's key, so the next reply starts on the next key.
+async fn generate_with_failover(
+    gemini: &GeminiClient,
+    system_prompt: &str,
+    user_text: &str,
+    media_files: &[DownloadedMedia],
+) -> Result<String> {
+    let max_flows = gemini.pool_size().max(1) + 1;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    Ok((file_uri, mime_type))
+    for _ in 0..max_flows {
+        let lease = match gemini.acquire_lease() {
+            Some(l) => l,
+            None => {
+                // Every key is cooling down: wait for the earliest one to thaw.
+                gemini.wait_for_cooldown().await;
+                continue;
+            }
+        };
+
+        let mut file_uris: Vec<(String, String)> = Vec::new();
+        let mut rate_limited = false;
+        for file in media_files {
+            match gemini
+                .upload_file_with(&lease, &file.data, &file.mime, &file.display_name)
+                .await
+            {
+                Ok(uri) => {
+                    info!("Media uploaded to Gemini: {uri} ({})", file.mime);
+                    file_uris.push((uri, file.mime.clone()));
+                }
+                Err(GeminiError::RateLimited) => {
+                    rate_limited = true;
+                    break;
+                }
+                Err(GeminiError::Failed(e)) => {
+                    // Per-file tolerance: skip this attachment, keep the flow.
+                    warn!("Media upload failed for {}: {e}", file.display_name);
+                }
+            }
+        }
+        if rate_limited {
+            continue;
+        }
+
+        match gemini
+            .generate_content_with(&lease, system_prompt, user_text, &file_uris)
+            .await
+        {
+            Ok(text) => {
+                gemini.flow_success(&lease);
+                return Ok(text);
+            }
+            Err(GeminiError::RateLimited) => continue,
+            Err(GeminiError::Failed(e)) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("all Gemini API keys are currently rate-limited")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_mention_basic() {
+        assert_eq!(strip_mention("@AskMe what is this?"), "what is this?");
+        assert_eq!(strip_mention("what is this? @AskMe"), "what is this?");
+        assert_eq!(strip_mention("hey @askme what is this?"), "hey what is this?");
+        assert_eq!(strip_mention("@ASKME hi"), "hi");
+        assert_eq!(strip_mention("@AskMe @askme hi"), "hi");
+        assert_eq!(strip_mention("no mention here"), "no mention here");
+    }
+
+    #[test]
+    fn strip_mention_keeps_text_on_both_sides() {
+        assert_eq!(
+            strip_mention("please explain @AskMe this photo"),
+            "please explain this photo"
+        );
+    }
+
+    #[test]
+    fn strip_mention_does_not_mangle_longer_handles() {
+        assert_eq!(strip_mention("hi @AskMeBot"), "hi @AskMeBot");
+        assert_eq!(strip_mention("email askme@example.com"), "email askme@example.com");
+    }
+
+    #[test]
+    fn strip_mention_unicode_safe() {
+        // Turkish 'İ' lowercases to 'i' + combining dot (byte length changes).
+        // A lowercase-then-slice implementation would panic here; ours must not.
+        assert_eq!(
+            strip_mention("İstanbul hakkında @askme ne düşünüyorsun"),
+            "İstanbul hakkında ne düşünüyorsun"
+        );
+        // Mention followed directly by an Arabic (non-ASCII) letter is still a mention.
+        assert_eq!(strip_mention("@AskMeهلا"), "هلا");
+        // Arabic question with the mention at the end keeps the question.
+        assert_eq!(strip_mention("ما هي عاصمة فرنسا؟ @AskMe"), "ما هي عاصمة فرنسا؟");
+    }
+
+    #[test]
+    fn strip_mention_only_mention() {
+        assert_eq!(strip_mention("@AskMe"), "");
+        assert_eq!(strip_mention("  @AskMe  "), "");
+    }
+
+    #[test]
+    fn collapse_spaces_works() {
+        assert_eq!(collapse_spaces("a  b\t\tc"), "a b c");
+        assert_eq!(collapse_spaces("  spaced  "), "spaced");
+        assert_eq!(collapse_spaces("keep\nnewlines  x"), "keep\nnewlines x");
+    }
+
+    #[test]
+    fn parse_test_post_id_works() {
+        let to_args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(parse_test_post_id(&to_args(&["bot", "--test-post", "123"])), Some(123));
+        assert_eq!(
+            parse_test_post_id(&to_args(&["bot", "--test-post", "123", "--post"])),
+            Some(123)
+        );
+        assert_eq!(
+            parse_test_post_id(&to_args(&["bot", "--test-post", "123", "--prompt", "hi"])),
+            Some(123)
+        );
+        assert_eq!(parse_test_post_id(&to_args(&["bot", "--test-post"])), None);
+        assert_eq!(parse_test_post_id(&to_args(&["bot", "--test-post", "--post"])), None);
+        assert_eq!(parse_test_post_id(&to_args(&["bot"])), None);
+    }
+
+    #[test]
+    fn parse_timestamp_formats() {
+        assert_eq!(parse_timestamp("1700000000"), Some(1700000000));
+        assert_eq!(parse_timestamp("1700000000000"), Some(1700000000)); // millis
+        assert_eq!(parse_timestamp("2023-11-14T22:13:20Z"), Some(1700000000));
+        assert_eq!(parse_timestamp(" 1700000000 "), Some(1700000000));
+        assert_eq!(parse_timestamp("not a date"), None);
+        assert_eq!(parse_timestamp(""), None);
+    }
+
+    fn notification(
+        id: u64,
+        nt: Option<&str>,
+        group: Option<&str>,
+        post_data: Option<Post>,
+        reply_post_data: Option<Post>,
+        original_post_data: Option<Post>,
+    ) -> Notification {
+        Notification {
+            id,
+            notification_type: nt.map(String::from),
+            group: group.map(String::from),
+            body: None,
+            post_data,
+            original_post_data,
+            reply_post_data,
+            is_read: None,
+            created_at: None,
+            action_url: None,
+        }
+    }
+
+    fn post_with_id(id: u64) -> Post {
+        Post {
+            id: Some(id),
+            post_id: None,
+            user: None,
+            parent_id: None,
+            post_comment: None,
+            media: None,
+            audio: None,
+            post_type: None,
+            created_at: None,
+            content: None,
+            comments: None,
+            images: None,
+            image: None,
+            attachments: None,
+            entities: None,
+        }
+    }
+
+    #[test]
+    fn mention_notification_detection() {
+        assert!(is_mention_notification(&notification(
+            1,
+            Some("user_mention"),
+            None,
+            None,
+            None,
+            None
+        )));
+        assert!(is_mention_notification(&notification(
+            1,
+            Some("mention"),
+            None,
+            None,
+            None,
+            None
+        )));
+        assert!(is_mention_notification(&notification(
+            1,
+            None,
+            Some("mentions"),
+            None,
+            None,
+            None
+        )));
+        assert!(!is_mention_notification(&notification(
+            1,
+            Some("post_reply"),
+            None,
+            None,
+            None,
+            None
+        )));
+    }
+
+    #[test]
+    fn notification_post_id_routing() {
+        // Mention: post_data wins.
+        let n = notification(
+            1,
+            Some("user_mention"),
+            None,
+            Some(post_with_id(10)),
+            Some(post_with_id(20)),
+            None,
+        );
+        assert_eq!(notification_post_id(&n), Some(10));
+
+        // Reply: reply_post_data wins, original is the fallback.
+        let n = notification(
+            1,
+            Some("post_reply"),
+            None,
+            None,
+            Some(post_with_id(30)),
+            Some(post_with_id(40)),
+        );
+        assert_eq!(notification_post_id(&n), Some(30));
+        let n = notification(
+            1,
+            Some("post_reply"),
+            None,
+            None,
+            None,
+            Some(post_with_id(40)),
+        );
+        assert_eq!(notification_post_id(&n), Some(40));
+
+        // Other types: post_data, then reply_post_data.
+        let n = notification(
+            1,
+            Some("like"),
+            None,
+            Some(post_with_id(50)),
+            None,
+            None,
+        );
+        assert_eq!(notification_post_id(&n), Some(50));
+        let n = notification(1, Some("like"), None, None, Some(post_with_id(60)), None);
+        assert_eq!(notification_post_id(&n), Some(60));
+        let n = notification(1, Some("like"), None, None, None, None);
+        assert_eq!(notification_post_id(&n), None);
+    }
+
+    // ── Scoped memory: section formatting & conversation resolution ──
+
+    fn user_fact(fact: &str) -> UserFactPayload {
+        UserFactPayload {
+            username: "khalid".to_string(),
+            fact: fact.to_string(),
+            category: FactCategory::Other,
+            source_post_id: 1,
+            source_conversation_id: 1,
+            first_seen: 100,
+            last_seen: 200,
+            times_confirmed: 1,
+            active: true,
+            superseded_by: None,
+        }
+    }
+
+    fn app_fact(fact: &str) -> AppFactPayload {
+        AppFactPayload {
+            topic: "platform".to_string(),
+            fact: fact.to_string(),
+            source: AppFactSource::Seed,
+            status: AppFactStatus::Active,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn user_profile_section_only_when_populated() {
+        assert_eq!(format_user_profile_section("khalid", &[]), "");
+        let section = format_user_profile_section(
+            "khalid",
+            &[user_fact("lives in Riyadh"), user_fact("is a teacher")],
+        );
+        assert_eq!(
+            section,
+            "\n[About khalid — long-term memory]\n- lives in Riyadh\n- is a teacher"
+        );
+    }
+
+    #[test]
+    fn app_knowledge_section_only_when_populated() {
+        assert_eq!(format_app_knowledge_section(&[]), "");
+        let section = format_app_knowledge_section(&[app_fact("Things is a social network")]);
+        assert_eq!(
+            section,
+            "\n[About Things — app knowledge]\n- Things is a social network"
+        );
+    }
+
+    /// AppState backed by an unavailable Qdrant: every memory read fails, so
+    /// conversation resolution must fall back to self-rooted ids.
+    pub(crate) fn test_state() -> Arc<RwLock<AppState>> {
+        let gemini = GeminiClient::new("test-key".to_string());
+        let qdrant = Arc::new(QdrantClient::unavailable(Arc::new(gemini.clone()), 4));
+        let memory_writer = qdrant.spawn_writer(5, Duration::from_millis(50));
+        let runtime = Arc::new(RwLock::new(RuntimeConfig {
+            memory: config::MemoryConfig {
+                user_facts_limit: 8,
+                app_knowledge_limit: 3,
+                app_knowledge_min_score: 0.72,
+                user_fact_supersede_threshold: 0.85,
+                forget_similarity_threshold: 0.80,
+                fact_extraction_enabled: true,
+            },
+            context_depth_limit: 20,
+        }));
+        let extraction_writer =
+            spawn_extraction_worker(gemini.clone(), qdrant.clone(), runtime.clone());
+        Arc::new(RwLock::new(AppState {
+            things: ThingsClient::new(),
+            gemini,
+            qdrant,
+            memory_writer,
+            extraction_writer,
+            runtime,
+            system_prompt: String::new(),
+            processed: HashSet::new(),
+            failures: HashMap::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn resolve_conversation_roots_new_mentions_at_themselves() {
+        let state = test_state();
+        let mut post = post_with_id(100);
+        post.parent_id = Some(50);
+        let post_data = models::PostData {
+            post: Some(post.clone()),
+            parent: None,
+            quoted: None,
+        };
+        // A fresh @mention NEVER inherits its parent's conversation — it is
+        // always the root of its own isolated conversation.
+        let (id, chain) = resolve_conversation(&state, &post_data, &post, false).await;
+        assert_eq!(id, 100);
+        // Memory is down in this fixture, so no ancestor walk can happen.
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_conversation_roots_parentless_posts_at_themselves() {
+        let state = test_state();
+        let post = post_with_id(100);
+        let post_data = models::PostData {
+            post: Some(post.clone()),
+            parent: None,
+            quoted: None,
+        };
+        let (id, chain) = resolve_conversation(&state, &post_data, &post, false).await;
+        assert_eq!(id, 100);
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_conversation_follow_up_falls_back_to_self_when_memory_down() {
+        let state = test_state();
+        let mut post = post_with_id(100);
+        post.parent_id = Some(50);
+        let post_data = models::PostData {
+            post: Some(post.clone()),
+            parent: None,
+            quoted: None,
+        };
+        // Follow-up whose parent cannot be looked up (memory down) starts its
+        // own conversation instead of failing.
+        let (id, _) = resolve_conversation(&state, &post_data, &post, true).await;
+        assert_eq!(id, 100);
+    }
+
+    #[test]
+    fn ancestor_chain_formats_oldest_first_with_limit() {
+        assert_eq!(format_ancestor_chain(&[], 20), "");
+        assert_eq!(
+            format_ancestor_chain(&[("a".to_string(), "root".to_string())], 0),
+            ""
+        );
+        let chain = vec![
+            ("a".to_string(), "root".to_string()),
+            ("b".to_string(), "middle".to_string()),
+            ("c".to_string(), "direct parent".to_string()),
+        ];
+        assert_eq!(
+            format_ancestor_chain(&chain, 20),
+            "\n[Conversation above]\na: root\nb: middle\nc: direct parent"
+        );
+        // The limit keeps the NEWEST entries.
+        assert_eq!(
+            format_ancestor_chain(&chain, 2),
+            "\n[Conversation above]\nb: middle\nc: direct parent"
+        );
+    }
 }

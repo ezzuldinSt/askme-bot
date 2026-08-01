@@ -2,7 +2,11 @@
 .env
 .token.json
 .processed-ids.json
+output.log
 .DS_Store
+
+# Admin panel config (contains API keys + password hash)
+bot_config.json
 
 # Qdrant data
 qdrant_data/

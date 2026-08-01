@@ -1,0 +1,453 @@
+//! Layered bot configuration and admin password storage.
+//!
+//! Precedence (highest first):
+//!   1. `bot_config.json` overrides (written by the admin panel)
+//!   2. environment variables (`.env`)
+//!   3. built-in defaults
+//!
+//! Admin bind/port are the exception: env always wins over the file, so an
+//! operator can relocate the panel without editing JSON.
+//!
+//! The file is written atomically (tmp + rename) with mode 600 — it holds the
+//! argon2 password hash and, if edited via the panel, API secrets.
+
+use anyhow::{Context, Result};
+use argon2::password_hash::{rand_core::OsRng, SaltString};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+/// Persisted configuration file (working directory).
+pub const CONFIG_FILE: &str = "bot_config.json";
+
+/// Initial admin password on first boot; the panel forces a change on first
+/// login, so it never survives beyond initial setup.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "CHANGEME";
+
+/// Default chat model for replies and extraction (hot-reloadable).
+pub const DEFAULT_GENERATION_MODEL: &str = "gemini-3.6-flash";
+/// Default embeddings model for memory vectors (restart-required).
+pub const DEFAULT_EMBEDDING_MODEL: &str = "gemini-embedding-2";
+/// Default embedding vector size (gemini-embedding-2 supports Matryoshka
+/// outputDimensionality; 512 keeps collections small).
+pub const DEFAULT_EMBEDDING_DIMENSIONS: u32 = 512;
+/// Default Qdrant gRPC endpoint.
+pub const DEFAULT_QDRANT_URL: &str = "http://localhost:6334";
+/// Valid Gemini 3.x thinking levels (None = let the model use its own default).
+pub const THINKING_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
+/// The embedding model used before DEFAULT_EMBEDDING_MODEL became the default;
+/// a missing migration marker is assumed to mean vectors of this model.
+pub const LEGACY_EMBEDDING_MODEL: &str = "gemini-embedding-001";
+
+/// Matches at/above this cosine similarity are treated as the same fact
+/// restated (or a direct contradiction) and supersede the old fact.
+/// Measured against gemini-embedding-2 @512: phrased contradictions ("moved to
+/// Jeddah recently" vs "lives in Riyadh") score ~0.81, genuinely different
+/// facts ("is a teacher" vs "lives in Riyadh") score ~0.62 — 0.78 sits between.
+pub const DEFAULT_USER_FACT_SUPERSEDE_THRESHOLD: f32 = 0.78;
+/// Matches at/above this similarity are deactivated on a forget request.
+/// Measured against gemini-embedding-2 @512: an Arabic forget phrase vs its
+/// English fact scores ~0.78 — 0.75 passes it with margin.
+pub const DEFAULT_FORGET_SIMILARITY_THRESHOLD: f32 = 0.75;
+
+/// Fields that only take effect after a process restart (the corresponding
+/// clients are constructed once at boot). API keys are NOT here: the key pool
+/// is hot-swapped live.
+pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
+    "qdrant_url",
+    "embedding_model",
+    "embedding_dimensions",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BotConfig {
+    pub admin: AdminConfig,
+    pub overrides: ConfigOverrides,
+    /// Bookkeeping written by the bot itself (not user-editable).
+    pub state: BotState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BotState {
+    /// Embedding model whose vectors are currently in Qdrant. Used to detect
+    /// model changes and auto-wipe the (incompatible) vector memory. `None`
+    /// means "pre-migration" and is treated as `LEGACY_EMBEDDING_MODEL`.
+    pub last_embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    /// argon2 hash of the admin panel password (never the password itself).
+    pub password_hash: String,
+    /// True until the default password has been replaced; the panel blocks
+    /// everything except the password-change endpoint while set.
+    pub must_change: bool,
+    pub bind: String,
+    pub port: u16,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            password_hash: String::new(),
+            must_change: true,
+            bind: "0.0.0.0".to_string(),
+            port: 1330,
+        }
+    }
+}
+
+/// Optional overrides written by the admin panel. `None` = fall through to
+/// the env var (or built-in default).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ConfigOverrides {
+    // Hot-applied (take effect immediately).
+    pub user_facts_limit: Option<u64>,
+    pub app_knowledge_limit: Option<u64>,
+    pub app_knowledge_min_score: Option<f32>,
+    pub user_fact_supersede_threshold: Option<f32>,
+    pub forget_similarity_threshold: Option<f32>,
+    pub fact_extraction_enabled: Option<bool>,
+    pub context_depth_limit: Option<usize>,
+    // Hot-applied.
+    /// Gemini API key pool (round-robin). Legacy single `gemini_api_key`
+    /// migrates into a pool of one.
+    pub gemini_api_keys: Vec<String>,
+    /// Chat model for replies/extraction (hot-applied, no restart needed).
+    pub generation_model: Option<String>,
+    /// Gemini 3.x thinking level: "minimal"|"low"|"medium"|"high", or None for
+    /// the model's own default (hot-applied, no restart needed).
+    pub thinking_level: Option<String>,
+    // Restart-required (clients built at boot).
+    /// Legacy single-key field, kept for backward compatibility with older
+    /// config files; folded into `gemini_api_keys` on load/save.
+    pub gemini_api_key: Option<String>,
+    pub qdrant_url: Option<String>,
+    pub embedding_model: Option<String>,
+    pub embedding_dimensions: Option<u64>,
+}
+
+/// override > env `GENERATION_MODEL` > default.
+pub fn resolve_generation_model(overrides: &ConfigOverrides) -> String {
+    overrides
+        .generation_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("GENERATION_MODEL").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_GENERATION_MODEL.to_string())
+}
+
+/// override > env `THINKING_LEVEL` > None (model default). Invalid values are
+/// ignored rather than propagated into requests.
+pub fn resolve_thinking_level(overrides: &ConfigOverrides) -> Option<String> {
+    let valid = |s: &String| THINKING_LEVELS.contains(&s.trim()).then(|| s.trim().to_string());
+    overrides
+        .thinking_level
+        .as_ref()
+        .and_then(valid)
+        .or_else(|| std::env::var("THINKING_LEVEL").ok().as_ref().and_then(valid))
+}
+
+/// override > env `EMBEDDING_MODEL` > default.
+pub fn resolve_embedding_model(overrides: &ConfigOverrides) -> String {
+    overrides
+        .embedding_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EMBEDDING_MODEL").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string())
+}
+
+/// override > env `EMBEDDING_DIMENSIONS` > default.
+pub fn resolve_embedding_dimensions(overrides: &ConfigOverrides) -> u64 {
+    overrides
+        .embedding_dimensions
+        .or_else(|| env_u64("EMBEDDING_DIMENSIONS"))
+        .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS as u64)
+}
+
+/// override > env `QDRANT_URL` > default.
+pub fn resolve_qdrant_url(overrides: &ConfigOverrides) -> String {
+    overrides
+        .qdrant_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("QDRANT_URL").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string())
+}
+
+/// Resolve the effective Gemini API key pool:
+/// file keys > env `GEMINI_API_KEYS` (CSV) > legacy file key > env key.
+pub fn resolve_gemini_keys(overrides: &ConfigOverrides) -> Vec<String> {
+    if !overrides.gemini_api_keys.is_empty() {
+        return overrides.gemini_api_keys.clone();
+    }
+    if let Ok(csv) = std::env::var("GEMINI_API_KEYS") {
+        let keys: Vec<String> = csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    if let Some(k) = &overrides.gemini_api_key {
+        if !k.trim().is_empty() {
+            return vec![k.trim().to_string()];
+        }
+    }
+    if let Ok(k) = std::env::var("GEMINI_API_KEY") {
+        if !k.trim().is_empty() {
+            return vec![k.trim().to_string()];
+        }
+    }
+    vec![]
+}
+
+/// Knobs controlling the three memory tiers.
+#[derive(Debug, Clone)]
+pub struct MemoryConfig {
+    pub user_facts_limit: u64,
+    pub app_knowledge_limit: u64,
+    pub app_knowledge_min_score: f32,
+    pub user_fact_supersede_threshold: f32,
+    pub forget_similarity_threshold: f32,
+    pub fact_extraction_enabled: bool,
+}
+
+/// The live, hot-reloadable configuration (swapped atomically on panel save).
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub memory: MemoryConfig,
+    pub context_depth_limit: usize,
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+fn env_f32(key: &str) -> Option<f32> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+impl RuntimeConfig {
+    /// Merge overrides > env > defaults into the effective runtime config.
+    pub fn resolve(overrides: &ConfigOverrides) -> Self {
+        let memory = MemoryConfig {
+            user_facts_limit: overrides
+                .user_facts_limit
+                .or_else(|| env_u64("USER_FACTS_LIMIT"))
+                .unwrap_or(8),
+            app_knowledge_limit: overrides
+                .app_knowledge_limit
+                .or_else(|| env_u64("APP_KNOWLEDGE_LIMIT"))
+                .unwrap_or(3),
+            // Measured against gemini-embedding-001 with bilingual seeds:
+            // genuine app questions score >=0.73, unrelated short texts <=0.70.
+            app_knowledge_min_score: overrides
+                .app_knowledge_min_score
+                .or_else(|| env_f32("APP_KNOWLEDGE_MIN_SCORE"))
+                .unwrap_or(0.72),
+            user_fact_supersede_threshold: overrides
+                .user_fact_supersede_threshold
+                .or_else(|| env_f32("USER_FACT_SUPERSEDE_THRESHOLD"))
+                .unwrap_or(DEFAULT_USER_FACT_SUPERSEDE_THRESHOLD),
+            forget_similarity_threshold: overrides
+                .forget_similarity_threshold
+                .or_else(|| env_f32("FORGET_SIMILARITY_THRESHOLD"))
+                .unwrap_or(DEFAULT_FORGET_SIMILARITY_THRESHOLD),
+            fact_extraction_enabled: overrides
+                .fact_extraction_enabled
+                .unwrap_or_else(|| {
+                    std::env::var("FACT_EXTRACTION_ENABLED")
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+                        .unwrap_or(true)
+                }),
+        };
+        Self {
+            memory,
+            context_depth_limit: overrides
+                .context_depth_limit
+                .or_else(|| env_usize("CONTEXT_DEPTH_LIMIT"))
+                .unwrap_or(20),
+        }
+    }
+}
+
+/// Load `bot_config.json` (missing/corrupt -> defaults) and apply env
+/// overrides for the admin bind address.
+pub fn load() -> BotConfig {
+    let mut cfg = match std::fs::read_to_string(CONFIG_FILE) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+            warn!("Failed to parse {CONFIG_FILE}: {e}; starting with defaults");
+            BotConfig::default()
+        }),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to read {CONFIG_FILE}: {e}; starting with defaults");
+            }
+            BotConfig::default()
+        }
+    };
+    if let Some(port) = env_u64("ADMIN_PORT") {
+        cfg.admin.port = port as u16;
+    }
+    if let Ok(bind) = std::env::var("ADMIN_BIND") {
+        if !bind.trim().is_empty() {
+            cfg.admin.bind = bind;
+        }
+    }
+    cfg
+}
+
+/// Persist the configuration atomically with owner-only permissions.
+pub fn save(cfg: &BotConfig) -> Result<()> {
+    let content = serde_json::to_string_pretty(cfg)?;
+    let tmp = format!("{CONFIG_FILE}.tmp");
+    std::fs::write(&tmp, content).with_context(|| format!("Failed to write {tmp}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+    std::fs::rename(&tmp, CONFIG_FILE).with_context(|| format!("Failed to rename {tmp}"))?;
+    Ok(())
+}
+
+/// Ensure a password hash exists (first boot: hash the default `CHANGEME`).
+pub fn ensure_password_hash(cfg: &mut BotConfig) -> Result<()> {
+    if !cfg.admin.password_hash.is_empty() {
+        return Ok(());
+    }
+    cfg.admin.password_hash = hash_password(DEFAULT_ADMIN_PASSWORD)?;
+    cfg.admin.must_change = true;
+    save(cfg)?;
+    info!("Initialized admin password to the default; change it on first login");
+    Ok(())
+}
+
+pub fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to hash password: {e}"))
+}
+
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    PasswordHash::new(hash)
+        .ok()
+        .and_then(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).ok())
+        .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overrides_beat_defaults() {
+        let overrides = ConfigOverrides {
+            user_facts_limit: Some(12),
+            fact_extraction_enabled: Some(false),
+            ..Default::default()
+        };
+        let cfg = RuntimeConfig::resolve(&overrides);
+        assert_eq!(cfg.memory.user_facts_limit, 12);
+        assert!(!cfg.memory.fact_extraction_enabled);
+        // Untouched fields fall through to env or default.
+        assert_eq!(cfg.memory.app_knowledge_limit, 3);
+        assert_eq!(cfg.context_depth_limit, 20);
+    }
+
+    #[test]
+    fn model_resolvers_use_defaults_and_overrides() {
+        let empty = ConfigOverrides::default();
+        assert_eq!(resolve_generation_model(&empty), DEFAULT_GENERATION_MODEL);
+        assert_eq!(resolve_embedding_model(&empty), DEFAULT_EMBEDDING_MODEL);
+        assert_eq!(resolve_embedding_dimensions(&empty), DEFAULT_EMBEDDING_DIMENSIONS as u64);
+        assert_eq!(resolve_qdrant_url(&empty), DEFAULT_QDRANT_URL);
+
+        let with = ConfigOverrides {
+            generation_model: Some("gemini-3.5-flash-lite".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_generation_model(&with), "gemini-3.5-flash-lite");
+        // Blank override falls through to default.
+        let blank = ConfigOverrides {
+            generation_model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_generation_model(&blank), DEFAULT_GENERATION_MODEL);
+    }
+
+    #[test]
+    fn thinking_level_resolver() {
+        let empty = ConfigOverrides::default();
+        assert_eq!(resolve_thinking_level(&empty), None, "untouched = model default");
+        let with = ConfigOverrides {
+            thinking_level: Some("low".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_thinking_level(&with), Some("low".to_string()));
+        // Invalid values are ignored, never propagated.
+        let bogus = ConfigOverrides {
+            thinking_level: Some("very-hard".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_thinking_level(&bogus), None);
+    }
+
+    #[test]
+    fn bot_state_defaults_to_no_marker() {
+        let cfg = BotConfig::default();
+        assert!(cfg.state.last_embedding_model.is_none());
+        // Older config files without the section still parse.
+        let parsed: BotConfig = serde_json::from_str(r#"{"admin":{"password_hash":"x"}}"#).unwrap();
+        assert!(parsed.state.last_embedding_model.is_none());
+    }
+
+    #[test]
+    fn password_hash_roundtrip() {
+        let hash = hash_password("s3cret!").unwrap();
+        assert!(verify_password("s3cret!", &hash));
+        assert!(!verify_password("wrong", &hash));
+        assert!(!verify_password("CHANGEME", &hash));
+        // Garbage hashes never panic.
+        assert!(!verify_password("s3cret!", "not-a-hash"));
+    }
+
+    #[test]
+    fn config_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("askme-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE);
+        let cfg = BotConfig {
+            admin: AdminConfig {
+                password_hash: "hash".to_string(),
+                must_change: false,
+                bind: "127.0.0.1".to_string(),
+                port: 9999,
+            },
+            overrides: ConfigOverrides {
+                user_facts_limit: Some(5),
+                ..Default::default()
+            },
+            state: BotState::default(),
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let loaded: BotConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.admin.port, 9999);
+        assert!(!loaded.admin.must_change);
+        assert_eq!(loaded.overrides.user_facts_limit, Some(5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

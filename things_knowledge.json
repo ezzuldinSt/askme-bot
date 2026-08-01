@@ -1,0 +1,34 @@
+[
+  {
+    "topic": "platform",
+    "fact": "Things is a social network where users publish posts and reply to each other in threads."
+  },
+  {
+    "topic": "platform",
+    "fact": "ثنقز هي شبكة تواصل اجتماعي ينشر فيها المستخدمون منشورات ويردون على بعضهم البعض في مواضيع."
+  },
+  {
+    "topic": "askme",
+    "fact": "AskMe is an AI assistant bot on Things; users mention @AskMe in a post or reply to ask a question."
+  },
+  {
+    "topic": "askme",
+    "fact": "أسك مي (AskMe) هو بوت ذكاء اصطناعي على ثنقز؛ يذكر المستخدمون @AskMe في منشور أو رد لطرح سؤال."
+  },
+  {
+    "topic": "askme",
+    "fact": "AskMe replies as a threaded reply under the post it was mentioned in."
+  },
+  {
+    "topic": "askme",
+    "fact": "يرد أسك مي كرد داخل موضوع المنشور الذي ذُكر فيه."
+  },
+  {
+    "topic": "askme",
+    "fact": "AskMe can look at images and videos attached to a post and answer questions about them."
+  },
+  {
+    "topic": "askme",
+    "fact": "يستطيع أسك مي مشاهدة الصور والفيديوهات المرفقة بالمنشور والإجابة عن الأسئلة المتعلقة بها."
+  }
+]

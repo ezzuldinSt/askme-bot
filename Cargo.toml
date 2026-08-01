@@ -14,7 +14,13 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 qdrant-client = "1.18.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+argon2 = "0.5"
+local-ip-address = "0.6"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

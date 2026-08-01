@@ -201,6 +201,23 @@ pub struct GenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<SystemInstruction>,
     pub contents: Vec<Content>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    pub generation_config: Option<GenerationConfig>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenerationConfig {
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+/// Gemini 3.x reasoning effort control (see ai.google.dev/gemini-api/docs/thinking).
+#[derive(Debug, Serialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "thinkingLevel")]
+    pub thinking_level: String,
 }
 
 #[derive(Debug, Serialize)]

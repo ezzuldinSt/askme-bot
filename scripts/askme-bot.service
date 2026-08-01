@@ -1,0 +1,15 @@
+[Unit]
+Description=AskMe — Things social network bot (with admin panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Things/askme-bot
+ExecStart=/root/Things/askme-bot/target/release/askme-bot
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

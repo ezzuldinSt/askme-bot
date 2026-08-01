@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AskMe Admin</title>
+<style>
+  :root {
+    --bg: #0a0e16;
+    --bg2: #0e1420;
+    --card: rgba(255,255,255,.045);
+    --card-hover: rgba(255,255,255,.07);
+    --border: rgba(255,255,255,.09);
+    --text: #e7ebf3;
+    --muted: #8b93a7;
+    --accent: #7c6cff;
+    --accent2: #9d8cff;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --radius: 14px;
+    --mono: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 80% -10%, rgba(124,108,255,.14), transparent 60%),
+                radial-gradient(900px 500px at -10% 110%, rgba(52,211,153,.07), transparent 55%),
+                var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+    min-height: 100vh;
+  }
+  .hidden { display: none !important; }
+  button { font: inherit; cursor: pointer; }
+  input, select { font: inherit; }
+
+  /* ── Views ── */
+  .center-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .auth-card {
+    width: 100%; max-width: 400px; padding: 36px 32px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 20px;
+    backdrop-filter: blur(14px); box-shadow: 0 24px 60px rgba(0,0,0,.45);
+  }
+  .logo {
+    width: 52px; height: 52px; border-radius: 16px; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--accent), #5a8bff); font-weight: 800; font-size: 24px; color: #fff;
+    box-shadow: 0 8px 24px rgba(124,108,255,.4); margin-bottom: 18px;
+  }
+  .auth-card h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .auth-card p { color: var(--muted); font-size: 14px; margin-bottom: 22px; line-height: 1.5; }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 7px; letter-spacing: .02em; }
+  .field input, .field select {
+    width: 100%; padding: 11px 13px; border-radius: 10px; border: 1px solid var(--border);
+    background: rgba(255,255,255,.05); color: var(--text); outline: none; transition: border-color .15s, background .15s;
+  }
+  .field input:focus { border-color: var(--accent); background: rgba(124,108,255,.08); }
+  .field input:disabled { opacity: .55; cursor: not-allowed; }
+  .field .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 11px 18px; border-radius: 10px; border: 1px solid transparent; font-weight: 600; font-size: 14px;
+    transition: transform .06s, filter .15s, background .15s; user-select: none;
+  }
+  .btn:active { transform: translateY(1px) scale(.99); }
+  .btn-primary { background: linear-gradient(135deg, var(--accent), #5a8bff); color: #fff; width: 100%; }
+  .btn-primary:hover { filter: brightness(1.12); }
+  .btn-ghost { background: rgba(255,255,255,.06); border-color: var(--border); color: var(--text); }
+  .btn-ghost:hover { background: var(--card-hover); }
+  .btn-danger { background: rgba(248,113,113,.14); border-color: rgba(248,113,113,.35); color: var(--danger); }
+  .btn-danger:hover { background: rgba(248,113,113,.22); }
+  .btn-sm { padding: 7px 12px; font-size: 13px; border-radius: 8px; }
+
+  /* ── Main layout ── */
+  header {
+    position: sticky; top: 0; z-index: 20; backdrop-filter: blur(16px);
+    background: rgba(10,14,22,.75); border-bottom: 1px solid var(--border);
+  }
+  .header-inner { max-width: 1080px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; gap: 14px; }
+  .logo-sm { width: 34px; height: 34px; border-radius: 10px; font-size: 17px; }
+  .header-title { font-weight: 700; font-size: 16px; }
+  .header-sub { font-size: 11px; color: var(--muted); }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; border: 1px solid var(--border); background: rgba(255,255,255,.05);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  nav.tabs { max-width: 1080px; margin: 0 auto; padding: 0 24px; display: flex; gap: 4px; }
+  .tab {
+    padding: 12px 16px; font-size: 14px; font-weight: 600; color: var(--muted); background: none; border: none;
+    border-bottom: 2px solid transparent; transition: color .15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { max-width: 1080px; margin: 0 auto; padding: 26px 24px 60px; }
+
+  .banner {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px; margin-bottom: 20px;
+    border-radius: 12px; background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.3);
+    color: var(--warn); font-size: 13px; font-weight: 600;
+  }
+  .grid { display: grid; gap: 16px; }
+  .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; backdrop-filter: blur(10px);
+  }
+  .card h3 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+  .stat-value { font-size: 26px; font-weight: 800; letter-spacing: -.02em; }
+  .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 14px; }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--muted); }
+  .row .v { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+  .chip {
+    display: inline-flex; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
+    background: rgba(124,108,255,.15); color: var(--accent2); border: 1px solid rgba(124,108,255,.3);
+  }
+  .chip.warn { background: rgba(251,191,36,.12); color: var(--warn); border-color: rgba(251,191,36,.3); }
+  .chip.ok { background: rgba(52,211,153,.12); color: var(--ok); border-color: rgba(52,211,153,.3); }
+  .section-title { font-size: 15px; font-weight: 700; margin: 28px 0 14px; display: flex; align-items: center; gap: 10px; }
+  .section-title:first-child { margin-top: 0; }
+
+  /* toggle */
+  .toggle { position: relative; width: 44px; height: 24px; flex: none; }
+  .toggle input { opacity: 0; width: 100%; height: 100%; position: absolute; cursor: pointer; margin: 0; }
+  .toggle .track { position: absolute; inset: 0; border-radius: 999px; background: rgba(255,255,255,.12); transition: background .15s; pointer-events: none; }
+  .toggle .thumb { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s; pointer-events: none; }
+  .toggle input:checked ~ .track { background: var(--accent); }
+  .toggle input:checked ~ .thumb { left: 23px; }
+
+  /* logs */
+  .logs-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .log-view {
+    background: #070a10; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px; height: 520px; overflow-y: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-word; }
+  .log-ts { color: #5b6376; }
+  .log-level { font-weight: 700; padding: 0 6px; }
+  .log-level.INFO { color: #6ea8fe; }
+  .log-level.WARN { color: var(--warn); }
+  .log-level.ERROR { color: var(--danger); }
+  .log-level.DEBUG { color: #5b6376; }
+  .log-target { color: #7dd3a8; }
+  .log-empty { color: var(--muted); text-align: center; padding: 40px 0; }
+
+  /* modal */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 50; background: rgba(4,6,10,.7); backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .modal {
+    width: 100%; max-width: 440px; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 18px; padding: 26px; box-shadow: 0 24px 70px rgba(0,0,0,.6);
+  }
+  .modal h3 { font-size: 17px; margin-bottom: 10px; }
+  .modal p { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 18px; }
+  .modal p strong { color: var(--text); }
+  .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+
+  /* toasts */
+  #toasts { position: fixed; top: 18px; right: 18px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+  .toast {
+    padding: 13px 18px; border-radius: 12px; font-size: 14px; font-weight: 600; max-width: 380px;
+    background: var(--bg2); border: 1px solid var(--border); box-shadow: 0 14px 40px rgba(0,0,0,.5);
+    animation: slidein .2s ease-out;
+  }
+  .toast.ok { border-color: rgba(52,211,153,.4); color: var(--ok); }
+  .toast.err { border-color: rgba(248,113,113,.4); color: var(--danger); }
+  @keyframes slidein { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  .danger-card { border-color: rgba(248,113,113,.25); }
+  .danger-card h3 { color: var(--danger); }
+  .form-error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
+</style>
+</head>
+<body>
+<div id="toasts"></div>
+
+<!-- ═══ Login ═══ -->
+<div id="view-login" class="center-wrap hidden">
+  <div class="auth-card">
+    <div class="logo">A</div>
+    <h1>AskMe Admin</h1>
+    <p>Sign in to manage the bot. Default password is <strong>CHANGEME</strong> — you'll be asked to replace it on first login.</p>
+    <div class="field">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••">
+    </div>
+    <button class="btn btn-primary" id="login-btn">Sign in</button>
+    <div class="form-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- ═══ Forced password change ═══ -->
+<div id="view-force" class="center-wrap hidden">
+  <div class="auth-card">
+    <div class="logo">🔑</div>
+    <h1>Set a new password</h1>
+    <p>You're using the default password. Choose a new one (8+ characters) to unlock the panel.</p>
+    <div class="field">
+      <label for="force-new">New password</label>
+      <input id="force-new" type="password" autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label for="force-confirm">Confirm new password</label>
+      <input id="force-confirm" type="password" autocomplete="new-password">
+    </div>
+    <button class="btn btn-primary" id="force-btn">Set password &amp; continue</button>
+    <div class="form-error" id="force-error"></div>
+  </div>
+</div>
+
+<!-- ═══ Main ═══ -->
+<div id="view-main" class="hidden">
+  <header>
+    <div class="header-inner">
+      <div class="logo logo-sm">A</div>
+      <div>
+        <div class="header-title">AskMe Admin</div>
+        <div class="header-sub" id="header-sub">Things bot control panel</div>
+      </div>
+      <div class="spacer"></div>
+      <span class="pill" id="status-pill"><span class="dot warn"></span><span id="status-pill-text">…</span></span>
+      <button class="btn btn-ghost btn-sm" id="logout-btn">Log out</button>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="config">Configuration</button>
+      <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="security">Security</button>
+      <button class="tab" data-tab="danger">Danger Zone</button>
+    </nav>
+  </header>
+  <main>
+    <div id="restart-banner" class="banner hidden">⚠️ A restart-required setting changed. Restart the bot from the Danger Zone tab to apply it.</div>
+
+    <!-- Dashboard -->
+    <section id="tab-dashboard">
+      <div class="grid cols-4" id="stat-cards"></div>
+      <div class="section-title">API key pool</div>
+      <div class="card"><div id="key-pool"></div></div>
+      <div class="section-title">Memory collections</div>
+      <div class="card"><div id="collections"></div></div>
+      <div class="section-title">Live configuration</div>
+      <div class="card"><div id="live-config"></div></div>
+    </section>
+
+    <!-- Configuration -->
+    <section id="tab-config" class="hidden">
+      <div class="section-title">Generation model <span class="chip ok">applies instantly</span></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="field"><label>Chat model <span class="hint">used for replies and fact extraction</span></label>
+            <input id="cfg-generation_model" type="text" list="gen-model-list" spellcheck="false" autocomplete="off">
+            <datalist id="gen-model-list">
+              <option value="gemini-3.6-flash"></option>
+              <option value="gemini-3.5-flash"></option>
+              <option value="gemini-3.5-flash-lite"></option>
+              <option value="gemini-3.1-flash-lite"></option>
+            </datalist></div>
+        </div>
+        <div class="card">
+          <div class="field"><label>Thinking level <span class="hint">reasoning effort — Gemini 3.x models only; lower = faster replies</span></label>
+            <select id="cfg-thinking_level">
+              <option value="default">Model default</option>
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select></div>
+        </div>
+      </div>
+
+      <div class="section-title">Memory &amp; retrieval <span class="chip ok">applies instantly</span></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="field"><label>User facts limit <span class="hint">facts injected per prompt</span></label>
+            <input id="cfg-user_facts_limit" type="number" min="1" max="100"></div>
+          <div class="field"><label>App knowledge limit <span class="hint">app facts injected per prompt</span></label>
+            <input id="cfg-app_knowledge_limit" type="number" min="1" max="100"></div>
+          <div class="field"><label>Context depth limit <span class="hint">conversation messages per prompt</span></label>
+            <input id="cfg-context_depth_limit" type="number" min="1" max="200"></div>
+          <div class="row"><span class="k">Fact extraction</span>
+            <span class="toggle"><input id="cfg-fact_extraction_enabled" type="checkbox"><span class="track"></span><span class="thumb"></span></span></div>
+        </div>
+        <div class="card">
+          <div class="field"><label>App knowledge min score <span class="hint">0–1, gate for app facts</span></label>
+            <input id="cfg-app_knowledge_min_score" type="number" step="0.01" min="0" max="1"></div>
+          <div class="field"><label>User fact supersede threshold <span class="hint">0–1, contradiction detection</span></label>
+            <input id="cfg-user_fact_supersede_threshold" type="number" step="0.01" min="0" max="1"></div>
+          <div class="field"><label>Forget similarity threshold <span class="hint">0–1, forget-request matching</span></label>
+            <input id="cfg-forget_similarity_threshold" type="number" step="0.01" min="0" max="1"></div>
+        </div>
+      </div>
+
+      <div class="section-title">Gemini API keys <span class="chip ok">applies instantly</span></div>
+      <div class="card">
+        <div class="field"><label>Key pool — one key per line <span class="hint">replies rotate round-robin; rate-limited keys cool down automatically</span></label>
+          <textarea id="cfg-gemini_api_keys" rows="4" spellcheck="false" autocomplete="off"
+            style="width:100%; padding:11px 13px; border-radius:10px; border:1px solid var(--border); background:rgba(255,255,255,.05); color:var(--text); outline:none; font-family:var(--mono); font-size:13px; resize:vertical;"></textarea>
+          <div class="hint" id="cfg-keys-hint">Leave empty to keep the current pool. Paste keys to replace it entirely.</div></div>
+      </div>
+
+      <div class="section-title">Boot-time settings <span class="chip warn">requires restart</span></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="field"><label>Qdrant URL</label>
+            <input id="cfg-qdrant_url" type="text"></div>
+          <div class="field"><label>Things account (display only)</label>
+            <input id="cfg-things_email" type="text" disabled></div>
+        </div>
+        <div class="card">
+          <div class="field"><label>Embedding model</label>
+            <input id="cfg-embedding_model" type="text" list="emb-model-list" spellcheck="false" autocomplete="off">
+            <datalist id="emb-model-list">
+              <option value="gemini-embedding-2"></option>
+              <option value="gemini-embedding-2-preview"></option>
+              <option value="gemini-embedding-001"></option>
+            </datalist>
+            <div class="hint">⚠️ Changing this wipes the vector memory on next boot (incompatible embeddings).</div></div>
+          <div class="field"><label>Embedding dimensions</label>
+            <input id="cfg-embedding_dimensions" type="number" min="64" max="3072">
+            <div class="hint">Must match the Qdrant collection vector size — changing also wipes memory.</div></div>
+        </div>
+      </div>
+      <div style="margin-top:20px; display:flex; gap:10px;">
+        <button class="btn btn-primary" style="width:auto" id="config-save">Save configuration</button>
+        <button class="btn btn-ghost" id="config-reload">Discard changes</button>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section id="tab-logs" class="hidden">
+      <div class="logs-toolbar">
+        <select id="logs-level" class="btn-ghost btn-sm" style="padding:7px 10px; border-radius:8px; background:rgba(255,255,255,.06); border:1px solid var(--border); color:var(--text);">
+          <option value="">All levels</option>
+          <option value="INFO">INFO+</option>
+          <option value="WARN">WARN+</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <label style="font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="logs-autoscroll" checked> Auto-scroll
+        </label>
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" id="logs-clear">Clear view</button>
+        <button class="btn btn-primary btn-sm" style="width:auto" id="logs-copy">📋 Copy log</button>
+      </div>
+      <div class="log-view" id="log-view"><div class="log-empty">No log lines yet…</div></div>
+    </section>
+
+    <!-- Security -->
+    <section id="tab-security" class="hidden">
+      <div class="card" style="max-width:460px;">
+        <h3>Change admin password</h3>
+        <div class="field"><label>Current password</label><input id="sec-current" type="password" autocomplete="current-password"></div>
+        <div class="field"><label>New password</label><input id="sec-new" type="password" autocomplete="new-password"></div>
+        <div class="field"><label>Confirm new password</label><input id="sec-confirm" type="password" autocomplete="new-password"></div>
+        <button class="btn btn-primary" id="sec-save">Update password</button>
+        <div class="form-error" id="sec-error"></div>
+      </div>
+    </section>
+
+    <!-- Danger Zone -->
+    <section id="tab-danger" class="hidden">
+      <div class="grid cols-2">
+        <div class="card danger-card">
+          <h3>Wipe memory</h3>
+          <p style="color:var(--muted); font-size:14px; line-height:1.6; margin-bottom:16px;">
+            Deletes <strong>conversation memory</strong>, <strong>user profiles</strong> and <strong>app knowledge</strong>.
+            Processed-notification markers are kept, so no old mention is re-answered. App knowledge re-seeds automatically.
+          </p>
+          <button class="btn btn-danger" id="wipe-memory">Wipe memory…</button>
+        </div>
+        <div class="card danger-card">
+          <h3>Wipe everything</h3>
+          <p style="color:var(--muted); font-size:14px; line-height:1.6; margin-bottom:16px;">
+            Also wipes <strong>processed-notification markers</strong>. The bot may re-answer old mentions if any are still unread.
+            Requires typing <strong>WIPE</strong> to confirm.
+          </p>
+          <button class="btn btn-danger" id="wipe-all">Wipe EVERYTHING…</button>
+        </div>
+      </div>
+      <div class="section-title">Process</div>
+      <div class="card">
+        <div class="row"><span class="k">Restart the bot process (systemd brings it back in seconds). If not running under systemd, the bot stops.</span>
+          <button class="btn btn-ghost btn-sm" id="restart-btn">Restart bot…</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Modal -->
+<div id="modal-backdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <h3 id="modal-title"></h3>
+    <p id="modal-body"></p>
+    <div class="field hidden" id="modal-input-field">
+      <label id="modal-input-label"></label>
+      <input id="modal-input" type="text" autocomplete="off">
+    </div>
+    <div class="actions">
+      <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="modal-confirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { tab: 'dashboard', logsAfter: 0, logsTimer: null, dashTimer: null, logLines: [] };
+
+/* ── helpers ── */
+function toast(msg, kind = 'ok') {
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (res.status === 401) { showView('login'); throw new Error('unauthorized'); }
+  if (res.status === 403) {
+    const d = await res.json().catch(() => ({}));
+    if ((d.error || '').includes('password')) { showView('force'); throw new Error('must_change'); }
+  }
+  return res;
+}
+async function apiJson(path, opts = {}) {
+  const res = await api(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+function showView(name) {
+  for (const v of ['login', 'force', 'main']) $(`view-${v}`).classList.toggle('hidden', v !== name);
+  if (name === 'main') { loadStatus(); switchTab('dashboard'); }
+}
+function showModal({ title, body, requireText, confirmLabel, onConfirm }) {
+  $('modal-title').textContent = title;
+  $('modal-body').innerHTML = body;
+  $('modal-input-field').classList.toggle('hidden', !requireText);
+  $('modal-input').value = '';
+  $('modal-input-label').textContent = requireText ? `Type ${requireText} to confirm` : '';
+  $('modal-confirm').textContent = confirmLabel || 'Confirm';
+  $('modal-backdrop').classList.remove('hidden');
+  const close = () => { $('modal-backdrop').classList.add('hidden'); $('modal-confirm').onclick = $('modal-cancel').onclick = null; };
+  $('modal-cancel').onclick = close;
+  $('modal-confirm').onclick = async () => {
+    if (requireText && $('modal-input').value !== requireText) { toast(`Type ${requireText} to confirm`, 'err'); return; }
+    close(); await onConfirm();
+  };
+}
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; if (m) return `${m}m ${s % 60}s`; return `${s}s`;
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* ── auth ── */
+$('login-btn').onclick = async () => {
+  $('login-error').textContent = '';
+  try {
+    const d = await apiJson('/api/login', { method: 'POST', body: JSON.stringify({ password: $('login-password').value }) });
+    $('login-password').value = '';
+    showView(d.must_change ? 'force' : 'main');
+  } catch (e) { $('login-error').textContent = e.message === 'unauthorized' ? '' : e.message; }
+};
+$('login-password').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('login-btn').click(); });
+
+$('force-btn').onclick = async () => {
+  $('force-error').textContent = '';
+  const nw = $('force-new').value;
+  if (nw !== $('force-confirm').value) { $('force-error').textContent = 'Passwords do not match'; return; }
+  try {
+    await apiJson('/api/password', { method: 'POST', body: JSON.stringify({ current: 'CHANGEME', new: nw }) });
+    toast('Password set — welcome!');
+    showView('main');
+  } catch (e) { $('force-error').textContent = e.message; }
+};
+$('logout-btn').onclick = async () => { try { await api('/api/logout', { method: 'POST' }); } catch {} showView('login'); };
+
+/* ── tabs ── */
+document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => switchTab(t.dataset.tab); });
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
+  for (const s of ['dashboard', 'config', 'logs', 'security', 'danger']) $(`tab-${s}`).classList.toggle('hidden', s !== tab);
+  clearInterval(state.logsTimer); clearInterval(state.dashTimer);
+  if (tab === 'dashboard') { loadStatus(); state.dashTimer = setInterval(loadStatus, 10000); }
+  if (tab === 'config') loadConfig();
+  if (tab === 'logs') { state.logsAfter = 0; state.logLines = []; renderLogs(); pollLogs(); state.logsTimer = setInterval(pollLogs, 2000); }
+}
+
+/* ── dashboard ── */
+async function loadStatus() {
+  try {
+    const d = await apiJson('/api/status');
+    const ok = d.qdrant.available && d.things.auth_ok !== false;
+    $('status-pill-text').textContent = ok ? 'Online' : 'Degraded';
+    $('status-pill').querySelector('.dot').className = `dot ${ok ? 'ok' : 'bad'}`;
+    $('header-sub').textContent = `@${d.bot_username} · v${d.version} · up ${fmtUptime(d.uptime_secs)}`;
+    $('restart-banner').classList.toggle('hidden', !d.needs_restart);
+
+    const thingsPill = d.things.auth_ok === null ? ['warn', 'unknown'] : d.things.auth_ok ? ['ok', 'healthy'] : ['bad', 'EXPIRED'];
+    $('stat-cards').innerHTML = [
+      ['Uptime', fmtUptime(d.uptime_secs), 'since process start'],
+      ['Qdrant', d.qdrant.available ? 'Connected' : 'Down', d.qdrant.available ? 'memory active' : 'degraded mode'],
+      ['Things auth', `<span class="chip ${thingsPill[0]}">${thingsPill[1]}</span>`, esc(d.things.email || '')],
+      ['Extraction', d.config.fact_extraction_enabled ? 'On' : 'Off', 'background fact learning'],
+    ].map(([t, v, s]) => `<div class="card"><h3>${t}</h3><div class="stat-value">${v}</div><div class="stat-sub">${s}</div></div>`).join('');
+
+    $('collections').innerHTML = d.qdrant.collections.map((c) =>
+      `<div class="row"><span class="k">${esc(c.name)}</span><span class="v">${c.points ?? '—'} pts</span></div>`).join('');
+
+    const stateChip = (k) => {
+      if (k.state === 'active') return '<span class="chip ok">active</span>';
+      if (k.state === 'cooldown') return `<span class="chip warn">cooldown ${k.state_secs}s</span>`;
+      if (k.state === 'daily') return '<span class="chip warn">daily cap</span>';
+      return `<span class="chip" style="background:rgba(248,113,113,.14);color:var(--danger);border-color:rgba(248,113,113,.35);">dead</span>`;
+    };
+    $('key-pool').innerHTML = (d.gemini_pool || []).length
+      ? d.gemini_pool.map((k) =>
+        `<div class="row"><span class="k">${esc(k.masked)}</span>
+          <span style="display:flex; gap:10px; align-items:center;">
+            <span class="v" style="color:var(--muted); font-size:12px;">${k.uses} req · ${k.rate_limited}×429</span>
+            ${stateChip(k)}
+          </span></div>`).join('')
+      : '<div class="row"><span class="k">No keys configured</span></div>';
+
+    const labels = {
+      generation_model: 'Generation model', thinking_level: 'Thinking level',
+      user_facts_limit: 'User facts limit', app_knowledge_limit: 'App knowledge limit',
+      app_knowledge_min_score: 'App knowledge min score', user_fact_supersede_threshold: 'Supersede threshold',
+      forget_similarity_threshold: 'Forget threshold', fact_extraction_enabled: 'Fact extraction',
+      context_depth_limit: 'Context depth',
+    };
+    $('live-config').innerHTML = Object.entries(labels).map(([k, label]) => {
+      const v = k === 'thinking_level' ? (d.config[k] ?? 'default') : d.config[k];
+      return `<div class="row"><span class="k">${label}</span><span class="v">${v}</span></div>`;
+    }).join('');
+  } catch (e) { /* handled in api() */ }
+}
+
+/* ── configuration ── */
+const HOT_FIELDS = ['user_facts_limit', 'app_knowledge_limit', 'app_knowledge_min_score',
+  'user_fact_supersede_threshold', 'forget_similarity_threshold', 'context_depth_limit', 'generation_model'];
+let restartSnapshot = {};
+async function loadConfig() {
+  try {
+    const d = await apiJson('/api/config');
+    for (const f of HOT_FIELDS) $(`cfg-${f}`).value = d.hot[f];
+    $('cfg-fact_extraction_enabled').checked = d.hot.fact_extraction_enabled;
+    $('cfg-thinking_level').value = d.hot.thinking_level ?? 'default';
+    $('cfg-gemini_api_keys').value = '';
+    $('cfg-gemini_api_keys').placeholder = `${d.restart.gemini_keys_count} key(s) in pool — paste to replace`;
+    $('cfg-keys-hint').textContent = d.restart.gemini_keys_masked.length
+      ? `Current pool: ${d.restart.gemini_keys_masked.join('  ')} — leave empty to keep, paste to replace entirely.`
+      : 'Leave empty to keep the current pool. Paste keys to replace it entirely.';
+    $('cfg-qdrant_url').value = d.restart.qdrant_url;
+    $('cfg-embedding_model').value = d.restart.embedding_model;
+    $('cfg-embedding_dimensions').value = d.restart.embedding_dimensions;
+    $('cfg-things_email').value = d.things_email;
+    restartSnapshot = {
+      qdrant_url: d.restart.qdrant_url,
+      embedding_model: d.restart.embedding_model,
+      embedding_dimensions: String(d.restart.embedding_dimensions),
+    };
+    $('restart-banner').classList.toggle('hidden', !d.needs_restart);
+  } catch (e) {}
+}
+$('config-reload').onclick = loadConfig;
+$('config-save').onclick = async () => {
+  const body = { fact_extraction_enabled: $('cfg-fact_extraction_enabled').checked };
+  for (const f of HOT_FIELDS) {
+    if (f === 'generation_model') { body[f] = $(`cfg-${f}`).value; continue; }
+    body[f] = f.includes('threshold') || f.includes('score') ? parseFloat($(`cfg-${f}`).value) : parseInt($(`cfg-${f}`).value, 10);
+  }
+  if (Object.entries(body).some(([k, v]) => k !== 'generation_model' && typeof v === 'number' && Number.isNaN(v))) { toast('Fill every field with a valid number', 'err'); return; }
+  body.gemini_api_keys = $('cfg-gemini_api_keys').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  body.thinking_level = $('cfg-thinking_level').value;
+  // Restart-required fields: send "" when untouched so the server never sees
+  // phantom changes (the phantom "restart required" bug).
+  body.qdrant_url = $('cfg-qdrant_url').value === restartSnapshot.qdrant_url ? '' : $('cfg-qdrant_url').value;
+  body.embedding_model = $('cfg-embedding_model').value === restartSnapshot.embedding_model ? '' : $('cfg-embedding_model').value;
+  body.embedding_dimensions = String($('cfg-embedding_dimensions').value) === restartSnapshot.embedding_dimensions
+    ? 0 : (parseInt($('cfg-embedding_dimensions').value, 10) || 0);
+  try {
+    const d = await apiJson('/api/config', { method: 'PUT', body: JSON.stringify(body) });
+    if (d.restart_required) { toast('Saved. Some settings need a restart (Danger Zone tab).', 'ok'); $('restart-banner').classList.remove('hidden'); }
+    else toast('Saved — applied instantly');
+    loadConfig();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+/* ── logs ── */
+const LEVEL_ORDER = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+async function pollLogs() {
+  try {
+    const d = await apiJson(`/api/logs?after=${state.logsAfter}`);
+    state.logsAfter = d.next;
+    if (d.lines.length) { state.logLines.push(...d.lines); renderLogs(); }
+  } catch (e) {}
+}
+function renderLogs() {
+  const min = $('logs-level').value;
+  const lines = min ? state.logLines.filter((l) => (LEVEL_ORDER[l.level] ?? 1) >= LEVEL_ORDER[min]) : state.logLines;
+  const view = $('log-view');
+  view.innerHTML = lines.length
+    ? lines.map((l) => `<div class="log-line"><span class="log-ts">${l.ts}</span><span class="log-level ${l.level}">${l.level.padEnd(5)}</span><span class="log-target">${esc(l.target)}</span> ${esc(l.text)}</div>`).join('')
+    : '<div class="log-empty">No log lines yet…</div>';
+  if ($('logs-autoscroll').checked) view.scrollTop = view.scrollHeight;
+}
+$('logs-level').onchange = renderLogs;
+$('logs-autoscroll').onchange = renderLogs;
+$('logs-clear').onclick = () => { state.logLines = []; renderLogs(); };
+$('logs-copy').onclick = async () => {
+  const text = state.logLines.map((l) => `${l.ts} ${l.level.padEnd(5)} ${l.target}: ${l.text}`).join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Copied ${state.logLines.length} lines`);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+    toast(`Copied ${state.logLines.length} lines`);
+  }
+};
+
+/* ── security ── */
+$('sec-save').onclick = async () => {
+  $('sec-error').textContent = '';
+  const nw = $('sec-new').value;
+  if (nw !== $('sec-confirm').value) { $('sec-error').textContent = 'Passwords do not match'; return; }
+  try {
+    await apiJson('/api/password', { method: 'POST', body: JSON.stringify({ current: $('sec-current').value, new: nw }) });
+    $('sec-current').value = $('sec-new').value = $('sec-confirm').value = '';
+    toast('Password updated');
+  } catch (e) { $('sec-error').textContent = e.message; }
+};
+
+/* ── danger zone ── */
+$('wipe-memory').onclick = () => showModal({
+  title: 'Wipe memory?',
+  body: 'Deletes <strong>conversation memory</strong>, <strong>user profiles</strong> and <strong>app knowledge</strong>.<br><br>Processed-notification markers are <strong>kept</strong> — the bot will not re-answer old mentions. App knowledge re-seeds automatically.',
+  confirmLabel: 'Wipe memory',
+  onConfirm: async () => {
+    try { await apiJson('/api/wipe', { method: 'POST', body: JSON.stringify({ scope: 'memory', confirm: 'WIPE' }) }); toast('Memory wiped (markers kept)'); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+});
+$('wipe-all').onclick = () => showModal({
+  title: 'Wipe EVERYTHING?',
+  body: 'Also wipes <strong>processed-notification markers</strong>.<br><br>The bot may <strong>re-answer old mentions</strong> that are still unread. This cannot be undone.',
+  requireText: 'WIPE', confirmLabel: 'Wipe everything',
+  onConfirm: async () => {
+    try { await apiJson('/api/wipe', { method: 'POST', body: JSON.stringify({ scope: 'all', confirm: 'WIPE' }) }); toast('Everything wiped'); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+});
+$('restart-btn').onclick = () => showModal({
+  title: 'Restart the bot?',
+  body: 'The process exits and systemd brings it back within seconds. The panel will be unreachable for a moment.<br><br>If the bot is <strong>not</strong> running under systemd, it simply stops.',
+  confirmLabel: 'Restart',
+  onConfirm: async () => {
+    try { await apiJson('/api/restart', { method: 'POST' }); toast('Restarting — back in a few seconds'); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+});
+
+/* ── boot ── */
+(async () => { try { await api('/api/status'); showView('main'); } catch { showView('login'); } })();
+</script>
+</body>
+</html>
