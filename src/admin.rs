@@ -384,6 +384,7 @@ async fn status(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Value>>
         "gemini_pool": gemini.pool_status(),
         "config": {
             "generation_model": gemini.generation_model(),
+            "extraction_model": gemini.extraction_model(),
             "thinking_level": gemini.thinking_level(),
             "user_facts_limit": runtime.memory.user_facts_limit,
             "app_knowledge_limit": runtime.memory.app_knowledge_limit,
@@ -438,12 +439,19 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "user_fact_supersede_threshold": m.user_fact_supersede_threshold,
             "forget_similarity_threshold": m.forget_similarity_threshold,
             "fact_extraction_enabled": m.fact_extraction_enabled,
+            "extraction_min_chars": m.extraction_min_chars,
             "context_depth_limit": resolved.context_depth_limit,
             "generation_model": config::resolve_generation_model(o),
+            // Raw override ("" when unset) for the form + the effective value
+            // for display: unset means "same as the chat model".
+            "extraction_model": o.extraction_model.clone().unwrap_or_default(),
+            "extraction_model_effective": config::resolve_extraction_model(o)
+                .unwrap_or_else(|| config::resolve_generation_model(o)),
             "thinking_level": config::resolve_thinking_level(o),
             "tools": {
                 "enabled": resolved.tools.enabled,
                 "max_rounds": resolved.tools.max_rounds,
+                "max_flow_attempts": resolved.tools.max_flow_attempts,
                 "web_fetch_max_bytes": resolved.tools.web_fetch_max_bytes,
                 "web_fetch_timeout_secs": resolved.tools.web_fetch_timeout_secs,
                 "user_scan_posts_limit": resolved.tools.user_scan_posts_limit,
@@ -461,6 +469,7 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "context_depth_limit": o.context_depth_limit.is_some(),
             "gemini_api_keys": !o.gemini_api_keys.is_empty(),
             "generation_model": o.generation_model.is_some(),
+            "extraction_model": o.extraction_model.is_some(),
             "thinking_level": o.thinking_level.is_some(),
             "qdrant_url": o.qdrant_url.is_some(),
             "embedding_model": o.embedding_model.is_some(),
@@ -489,10 +498,12 @@ struct ConfigUpdate {
     user_fact_supersede_threshold: f32,
     forget_similarity_threshold: f32,
     fact_extraction_enabled: bool,
+    extraction_min_chars: usize,
     context_depth_limit: usize,
     // Tool calling (hot-applied, always concrete values from the form).
     tools_enabled: bool,
     max_tool_rounds: usize,
+    max_flow_attempts: usize,
     web_fetch_max_bytes: usize,
     web_fetch_timeout_secs: u64,
     user_scan_posts_limit: u64,
@@ -501,6 +512,8 @@ struct ConfigUpdate {
     // Hot-applied (empty/None = leave unchanged).
     gemini_api_keys: Option<Vec<String>>,
     generation_model: Option<String>,
+    /// Extraction model: empty = "same as chat model" (clears the override).
+    extraction_model: Option<String>,
     /// "default" or one of THINKING_LEVELS (empty/None = leave unchanged).
     thinking_level: Option<String>,
     // Restart-required (empty/None = leave unchanged).
@@ -591,6 +604,12 @@ async fn put_config(
     if !(1..=8).contains(&req.max_tool_rounds) {
         return err(StatusCode::BAD_REQUEST, "max_tool_rounds must be 1-8");
     }
+    if !(1..=8).contains(&req.max_flow_attempts) {
+        return err(StatusCode::BAD_REQUEST, "max_flow_attempts must be 1-8");
+    }
+    if req.extraction_min_chars > 500 {
+        return err(StatusCode::BAD_REQUEST, "extraction_min_chars must be 0-500");
+    }
     if !(16_384..=2_000_000).contains(&req.web_fetch_max_bytes) {
         return err(StatusCode::BAD_REQUEST, "web_fetch_max_bytes must be 16384-2000000");
     }
@@ -610,9 +629,11 @@ async fn put_config(
     o.user_fact_supersede_threshold = Some(req.user_fact_supersede_threshold);
     o.forget_similarity_threshold = Some(req.forget_similarity_threshold);
     o.fact_extraction_enabled = Some(req.fact_extraction_enabled);
+    o.extraction_min_chars = Some(req.extraction_min_chars);
     o.context_depth_limit = Some(req.context_depth_limit);
     o.tools_enabled = Some(req.tools_enabled);
     o.max_tool_rounds = Some(req.max_tool_rounds);
+    o.max_flow_attempts = Some(req.max_flow_attempts);
     o.web_fetch_max_bytes = Some(req.web_fetch_max_bytes);
     o.web_fetch_timeout_secs = Some(req.web_fetch_timeout_secs);
     o.user_scan_posts_limit = Some(req.user_scan_posts_limit);
@@ -661,6 +682,20 @@ async fn put_config(
     if let Some(m) = &new_generation_model {
         o.generation_model = Some(m.clone());
     }
+
+    // Extraction model: empty string = "same as chat model" (clears the
+    // override); a value sets it. Hot-applied, no restart.
+    let new_extraction_model = match req.extraction_model {
+        Some(m) => {
+            let m = m.trim().to_string();
+            if m.chars().any(char::is_whitespace) {
+                return err(StatusCode::BAD_REQUEST, "extraction model must not contain whitespace");
+            }
+            o.extraction_model = if m.is_empty() { None } else { Some(m) };
+            Some(o.extraction_model.clone())
+        }
+        None => None,
+    };
 
     // Thinking level: "default" clears the override (model default); one of
     // THINKING_LEVELS sets it; anything else is rejected. Hot-applied.
@@ -729,6 +764,9 @@ async fn put_config(
     }
     if let Some(m) = new_generation_model {
         gemini.set_generation_model(m);
+    }
+    if let Some(m) = new_extraction_model {
+        gemini.set_extraction_model(m);
     }
     if let Some(level) = new_thinking_level {
         gemini.set_thinking_level(level);

@@ -129,12 +129,18 @@ pub struct ConfigOverrides {
     pub user_scan_posts_limit: Option<u64>,
     /// Max NEW facts auto-saved from one profile scan.
     pub user_scan_fact_cap: Option<usize>,
+    /// Mentions shorter than this skip background fact extraction (0 = extract all).
+    pub extraction_min_chars: Option<usize>,
+    /// Max key-failover attempts per reply flow (each arm re-runs the flow).
+    pub max_flow_attempts: Option<usize>,
     // Hot-applied.
     /// Gemini API key pool (round-robin). Legacy single `gemini_api_key`
     /// migrates into a pool of one.
     pub gemini_api_keys: Vec<String>,
-    /// Chat model for replies/extraction (hot-applied, no restart needed).
+    /// Chat model for replies (hot-applied, no restart needed).
     pub generation_model: Option<String>,
+    /// Cheaper model for fact extraction/FAQ jobs; None = use generation_model.
+    pub extraction_model: Option<String>,
     /// Gemini 3.x thinking level: "minimal"|"low"|"medium"|"high", or None for
     /// the model's own default (hot-applied, no restart needed).
     pub thinking_level: Option<String>,
@@ -166,6 +172,15 @@ pub fn resolve_thinking_level(overrides: &ConfigOverrides) -> Option<String> {
         .as_ref()
         .and_then(valid)
         .or_else(|| std::env::var("THINKING_LEVEL").ok().as_ref().and_then(valid))
+}
+
+/// override > env `EXTRACTION_MODEL` > None (None = use the generation model).
+pub fn resolve_extraction_model(overrides: &ConfigOverrides) -> Option<String> {
+    overrides
+        .extraction_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EXTRACTION_MODEL").ok().filter(|s| !s.trim().is_empty()))
 }
 
 /// override > env `EMBEDDING_MODEL` > default.
@@ -234,6 +249,8 @@ pub struct MemoryConfig {
     pub user_fact_supersede_threshold: f32,
     pub forget_similarity_threshold: f32,
     pub fact_extraction_enabled: bool,
+    /// Mentions shorter than this skip background fact extraction (0 = extract all).
+    pub extraction_min_chars: usize,
 }
 
 /// The live, hot-reloadable configuration (swapped atomically on panel save).
@@ -254,6 +271,8 @@ pub struct ToolsConfig {
     pub user_scan_posts_limit: u64,
     pub user_scan_fact_cap: usize,
     pub url_context_enabled: bool,
+    /// Max key-failover attempts per reply flow (each arm re-runs the flow).
+    pub max_flow_attempts: usize,
 }
 
 fn env_u64(key: &str) -> Option<u64> {
@@ -303,6 +322,11 @@ impl RuntimeConfig {
                         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
                         .unwrap_or(true)
                 }),
+            extraction_min_chars: overrides
+                .extraction_min_chars
+                .or_else(|| env_usize("EXTRACTION_MIN_CHARS"))
+                .unwrap_or(24)
+                .clamp(0, 500),
         };
         Self {
             memory,
@@ -345,6 +369,11 @@ impl RuntimeConfig {
                         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
                         .unwrap_or(true)
                 }),
+                max_flow_attempts: overrides
+                    .max_flow_attempts
+                    .or_else(|| env_usize("MAX_FLOW_ATTEMPTS"))
+                    .unwrap_or(3)
+                    .clamp(1, 8),
             },
         }
     }
@@ -455,6 +484,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_generation_model(&blank), DEFAULT_GENERATION_MODEL);
+    }
+
+    #[test]
+    fn extraction_model_resolver_defaults_to_none() {
+        let empty = ConfigOverrides::default();
+        assert_eq!(resolve_extraction_model(&empty), None, "unset = same as generation model");
+        let with = ConfigOverrides {
+            extraction_model: Some("gemini-3.5-flash-lite".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_extraction_model(&with),
+            Some("gemini-3.5-flash-lite".to_string())
+        );
+        let blank = ConfigOverrides {
+            extraction_model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_extraction_model(&blank), None);
+    }
+
+    #[test]
+    fn cost_knobs_resolve_with_defaults_and_clamps() {
+        let cfg = RuntimeConfig::resolve(&ConfigOverrides::default());
+        assert_eq!(cfg.memory.extraction_min_chars, 24);
+        assert_eq!(cfg.tools.max_flow_attempts, 3);
+        let with = ConfigOverrides {
+            extraction_min_chars: Some(0),
+            max_flow_attempts: Some(99),
+            ..Default::default()
+        };
+        let cfg = RuntimeConfig::resolve(&with);
+        assert_eq!(cfg.memory.extraction_min_chars, 0, "0 = extract everything");
+        assert_eq!(cfg.tools.max_flow_attempts, 8, "clamped to the 1-8 range");
     }
 
     #[test]

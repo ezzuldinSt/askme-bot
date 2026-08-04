@@ -302,6 +302,11 @@ impl QdrantClient {
             .ok_or_else(|| anyhow::anyhow!("Embedder returned no vector"))
     }
 
+    /// Embed several texts in one batched request (one API call instead of N).
+    pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embedder.embed_texts(texts).await
+    }
+
     /// Store a single conversation message, computing its embedding on the spot.
     ///
     /// Used for writes that must be immediately visible (bot replies and

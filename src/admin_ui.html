@@ -322,7 +322,7 @@
       <div class="section-title">Generation model <span class="chip ok">applies instantly</span></div>
       <div class="grid cols-2">
         <div class="card">
-          <div class="field"><label>Chat model <span class="hint">used for replies and fact extraction</span></label>
+          <div class="field"><label>Chat model <span class="hint">used for replies</span></label>
             <input id="cfg-generation_model" type="text" list="gen-model-list" spellcheck="false" autocomplete="off">
             <datalist id="gen-model-list">
               <option value="gemini-3.6-flash"></option>
@@ -330,6 +330,8 @@
               <option value="gemini-3.5-flash-lite"></option>
               <option value="gemini-3.1-flash-lite"></option>
             </datalist></div>
+          <div class="field"><label>Extraction model <span class="hint">fact extraction / FAQ / rewrites — empty = same as chat model; a separate quota bucket</span></label>
+            <input id="cfg-extraction_model" type="text" list="gen-model-list" spellcheck="false" autocomplete="off"></div>
         </div>
         <div class="card">
           <div class="field"><label>Thinking level <span class="hint">reasoning effort — Gemini 3.x models only; lower = faster replies</span></label>
@@ -362,6 +364,8 @@
             <input id="cfg-user_fact_supersede_threshold" type="number" step="0.01" min="0" max="1"></div>
           <div class="field"><label>Forget similarity threshold <span class="hint">0–1, forget-request matching</span></label>
             <input id="cfg-forget_similarity_threshold" type="number" step="0.01" min="0" max="1"></div>
+          <div class="field"><label>Extraction min chars <span class="hint">shorter mentions skip fact extraction (0 = extract all)</span></label>
+            <input id="cfg-extraction_min_chars" type="number" min="0" max="500"></div>
         </div>
       </div>
 
@@ -376,6 +380,8 @@
           <div class="hint" style="margin-top:6px;">Gemini's URL context tool fetches http(s) links in the question automatically; web_fetch stays as fallback.</div>
           <div class="field"><label>Max tool rounds <span class="hint">API calls per reply (1-8)</span></label>
             <input id="cfg-max_tool_rounds" type="number" min="1" max="8"></div>
+          <div class="field"><label>Max flow attempts <span class="hint">key-failover re-runs per reply (1-8); each re-runs the whole flow</span></label>
+            <input id="cfg-max_flow_attempts" type="number" min="1" max="8"></div>
           <div class="field"><label>Profile scan posts <span class="hint">posts read per user lookup (1-30)</span></label>
             <input id="cfg-user_scan_posts_limit" type="number" min="1" max="30"></div>
         </div>
@@ -645,12 +651,20 @@ async function loadStatus() {
 /* ── configuration ── */
 const HOT_FIELDS = ['user_facts_limit', 'app_knowledge_limit', 'app_knowledge_min_score',
   'user_fact_supersede_threshold', 'forget_similarity_threshold', 'context_depth_limit', 'generation_model',
-  'max_tool_rounds', 'web_fetch_max_bytes', 'web_fetch_timeout_secs', 'user_scan_posts_limit', 'user_scan_fact_cap'];
+  'extraction_min_chars'];
+/* Tool fields are nested under hot.tools in the config JSON — form id -> JSON key. */
+const TOOL_FIELDS = { max_tool_rounds: 'max_rounds', max_flow_attempts: 'max_flow_attempts',
+  web_fetch_max_bytes: 'web_fetch_max_bytes', web_fetch_timeout_secs: 'web_fetch_timeout_secs',
+  user_scan_posts_limit: 'user_scan_posts_limit', user_scan_fact_cap: 'user_scan_fact_cap' };
+const TOOL_IDS = Object.keys(TOOL_FIELDS);
 let restartSnapshot = {};
 async function loadConfig() {
   try {
     const d = await apiJson('/api/config');
     for (const f of HOT_FIELDS) $(`cfg-${f}`).value = d.hot[f];
+    for (const f of TOOL_IDS) $(`cfg-${f}`).value = d.hot.tools[TOOL_FIELDS[f]];
+    $('cfg-extraction_model').value = d.hot.extraction_model;
+    $('cfg-extraction_model').placeholder = `${d.hot.extraction_model_effective} (same as chat model)`;
     $('cfg-fact_extraction_enabled').checked = d.hot.fact_extraction_enabled;
     $('cfg-tools_enabled').checked = d.hot.tools.enabled;
     $('cfg-url_context_enabled').checked = d.hot.tools.url_context_enabled;
@@ -679,7 +693,9 @@ $('config-save').onclick = async () => {
     if (f === 'generation_model') { body[f] = $(`cfg-${f}`).value; continue; }
     body[f] = f.includes('threshold') || f.includes('score') ? parseFloat($(`cfg-${f}`).value) : parseInt($(`cfg-${f}`).value, 10);
   }
-  if (Object.entries(body).some(([k, v]) => k !== 'generation_model' && typeof v === 'number' && Number.isNaN(v))) { toast('Fill every field with a valid number', 'err'); return; }
+  for (const f of TOOL_IDS) body[f] = parseInt($(`cfg-${f}`).value, 10);
+  body.extraction_model = $('cfg-extraction_model').value;
+  if (Object.entries(body).some(([k, v]) => k !== 'generation_model' && k !== 'extraction_model' && typeof v === 'number' && Number.isNaN(v))) { toast('Fill every field with a valid number', 'err'); return; }
   body.gemini_api_keys = $('cfg-gemini_api_keys').value.split('\n').map((s) => s.trim()).filter(Boolean);
   body.thinking_level = $('cfg-thinking_level').value;
   // Restart-required fields: send "" when untouched so the server never sees

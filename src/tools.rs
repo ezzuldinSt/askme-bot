@@ -116,6 +116,45 @@ const ARABIC_NAME_VARIANTS: &[(&str, &[&str])] = &[
     ("مشعل", &["mishal", "meshal"]),
 ];
 
+/// Per-reply-flow API call counters (Gemini generate turns, file uploads,
+/// embedding requests) — logged at the end of each flow so per-reply cost
+/// is visible in the journal.
+#[derive(Debug, Default)]
+pub struct FlowMeter {
+    pub generates: std::sync::atomic::AtomicUsize,
+    pub uploads: std::sync::atomic::AtomicUsize,
+    pub embed_calls: std::sync::atomic::AtomicUsize,
+    pub embed_texts: std::sync::atomic::AtomicUsize,
+}
+
+impl FlowMeter {
+    pub fn gen(&self) {
+        self.generates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn upload(&self) {
+        self.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One embedding request covering `texts` texts (batched or not).
+    pub fn embed(&self, texts: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.embed_calls.fetch_add(1, Relaxed);
+        self.embed_texts.fetch_add(texts, Relaxed);
+    }
+
+    pub fn summary(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "{} generate, {} upload, {} embed ({} texts)",
+            self.generates.load(Relaxed),
+            self.uploads.load(Relaxed),
+            self.embed_calls.load(Relaxed),
+            self.embed_texts.load(Relaxed),
+        )
+    }
+}
+
 /// Shared handles the tools need. Built once per reply flow (cheap Arc clones).
 #[derive(Clone)]
 pub struct ToolContext {
@@ -126,6 +165,8 @@ pub struct ToolContext {
     /// Users the model looked up during this reply flow (shared with the
     /// reply flow itself, which may auto-brief the model on them).
     pub flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
+    /// Per-flow API call counters (shared with the reply flow itself).
+    pub meter: Arc<FlowMeter>,
 }
 
 impl ToolContext {
@@ -135,6 +176,7 @@ impl ToolContext {
         runtime: Arc<RwLock<RuntimeConfig>>,
         extraction_tx: mpsc::UnboundedSender<ExtractionTask>,
         flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
+        meter: Arc<FlowMeter>,
     ) -> Self {
         Self {
             things,
@@ -142,6 +184,7 @@ impl ToolContext {
             runtime,
             extraction_tx,
             flow_subjects,
+            meter,
         }
     }
 
@@ -591,6 +634,7 @@ impl ToolContext {
         if !self.qdrant.is_available() {
             return err("memory is unavailable");
         }
+        self.meter.embed(1);
         let vector = match self.qdrant.embed(query).await {
             Ok(v) => v,
             Err(e) => return err(format!("failed to embed query: {e}")),

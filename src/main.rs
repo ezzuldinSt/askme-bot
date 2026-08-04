@@ -36,7 +36,8 @@ use crate::qdrant_models::{
 };
 use crate::things_client::{is_auth_expired, ClientRejected, ThingsClient, TOKEN_FILE};
 use crate::tools::{
-    tool_declarations, ExtractionJob, ExtractionSource, ExtractionTask, FlowSubject, ToolContext,
+    tool_declarations, ExtractionJob, ExtractionSource, ExtractionTask, FlowMeter, FlowSubject,
+    ToolContext,
 };
 
 const BOT_USERNAME: &str = "AskMe";
@@ -147,10 +148,11 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let (generation_model, thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
+    let (generation_model, extraction_model, thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
         let cfg = bot_config.read().await;
         (
             config::resolve_generation_model(&cfg.overrides),
+            config::resolve_extraction_model(&cfg.overrides),
             config::resolve_thinking_level(&cfg.overrides),
             config::resolve_embedding_model(&cfg.overrides),
             config::resolve_embedding_dimensions(&cfg.overrides),
@@ -160,6 +162,7 @@ async fn main() -> Result<()> {
     let gemini = GeminiClient::with_keys(
         gemini_api_keys,
         generation_model,
+        extraction_model,
         thinking_level,
         embedding_model.clone(),
         embedding_dimensions as u32,
@@ -508,14 +511,16 @@ async fn test_post(
         }
     }
 
+    let meter = Arc::new(FlowMeter::default());
     let user_text = match prompt_override {
         Some(custom) => custom.to_string(),
         None => {
             if is_follow_up {
                 println!("=== Follow-up reply (parent is {BOT_USERNAME}) ===");
-                build_follow_up_prompt(state, post, &question, &post_data, conversation_id).await
+                build_follow_up_prompt(state, post, &question, &post_data, conversation_id, Some(&meter))
+                    .await
             } else {
-                build_mention_prompt(state, post, &question, &ancestors).await
+                build_mention_prompt(state, post, &question, &ancestors, Some(&meter)).await
             }
         }
     };
@@ -531,6 +536,7 @@ async fn test_post(
             s.runtime.clone(),
             s.extraction_writer.clone(),
             flow_subjects,
+            meter.clone(),
         )
     };
     println!(
@@ -545,9 +551,18 @@ async fn test_post(
         &tool_ctx,
     )
     .await?;
+    println!("=== API calls used: {} ===", meter.summary());
 
     println!("=== Raw response ===");
     println!("{response}");
+
+    let response = match clean_scaffold_leak(&gemini, response, &meter).await {
+        Ok(t) => t,
+        Err(()) => {
+            println!("=== Reply was unsalvageable scaffold leakage; would be dropped ===");
+            return Ok(());
+        }
+    };
 
     let reply_text = append_sources_footer(&response, &sources);
     let (reply_text, entities) = build_reply_with_entities(&reply_text, MAX_RESPONSE_LENGTH);
@@ -1129,13 +1144,15 @@ async fn process_notification(
         }
     }
 
+    let meter = Arc::new(FlowMeter::default());
     let user_text = if is_empty_mention {
         build_greeting_prompt(&state, &post, &post_data, &ancestors, is_follow_up, conversation_id)
             .await
     } else if is_follow_up {
-        build_follow_up_prompt(&state, &post, &question, &post_data, conversation_id).await
+        build_follow_up_prompt(&state, &post, &question, &post_data, conversation_id, Some(&meter))
+            .await
     } else {
-        build_mention_prompt(&state, &post, &question, &ancestors).await
+        build_mention_prompt(&state, &post, &question, &ancestors, Some(&meter)).await
     };
 
     info!(
@@ -1155,6 +1172,7 @@ async fn process_notification(
             s.runtime.clone(),
             s.extraction_writer.clone(),
             flow_subjects,
+            meter.clone(),
         )
     };
 
@@ -1175,9 +1193,23 @@ async fn process_notification(
     let response =
         generate_with_tools_failover(&gemini, &system_prompt, &user_text, &media_files, &tool_ctx)
             .await;
+    info!(
+        "Reply flow for notification {notification_id} used {} API call(s)",
+        meter.summary()
+    );
 
     let (reply_text, reply_entities) = match response {
         Ok((text, sources)) => {
+            let text = match clean_scaffold_leak(&gemini, text, &meter).await {
+                Ok(t) => t,
+                Err(()) => {
+                    error!(
+                        "Reply for notification {notification_id} was unsalvageable \
+                         scaffold leakage; dropping it"
+                    );
+                    return ProcessOutcome::Failed;
+                }
+            };
             let text = append_sources_footer(&text, &sources);
             let (reply_text, entities) = build_reply_with_entities(&text, MAX_RESPONSE_LENGTH);
             info!(
@@ -1251,8 +1283,17 @@ async fn process_notification(
         timestamp: unix_now(),
         media_urls: Vec::new(),
     };
-    if let Err(e) = qdrant.upsert(&reply_payload).await {
-        warn!("Failed to store bot reply {reply_id} in Qdrant: {e}");
+    // Batched writer (one embed call per flush, not per reply). A fast
+    // follow-up still sees this reply via the API parent chain, and the next
+    // poll is 3s out while the writer flushes every 2s.
+    if state
+        .read()
+        .await
+        .memory_writer
+        .send(MemoryWrite::Upsert(reply_payload))
+        .is_err()
+    {
+        warn!("Failed to queue bot reply {reply_id} for Qdrant");
     }
     if let Err(e) = qdrant.mark_processed(notification_id).await {
         warn!("Failed to mark notification {notification_id} processed in Qdrant: {e}");
@@ -1261,8 +1302,14 @@ async fn process_notification(
 
     // Long-term memory pass: pull durable user/app facts out of the user's
     // message in the background. Idempotent, so retries are harmless. Empty
-    // mentions have no content to extract from.
-    if !is_empty_mention {
+    // mentions — and trivially short ones (thanks/ok/emoji) — have nothing
+    // durable to teach, so they skip the extraction call entirely.
+    let extraction_min_chars = {
+        let runtime = state.read().await.runtime.clone();
+        let cfg = runtime.read().await;
+        cfg.memory.extraction_min_chars
+    };
+    if !is_empty_mention && passes_extraction_gate(&question, extraction_min_chars) {
         let _ = state
             .read()
             .await
@@ -1277,6 +1324,12 @@ async fn process_notification(
     }
 
     ProcessOutcome::Replied
+}
+
+/// Whether a mention is substantial enough to justify a background
+/// fact-extraction call (0 = extract everything).
+fn passes_extraction_gate(question: &str, min_chars: usize) -> bool {
+    question.trim().chars().count() >= min_chars
 }
 
 fn extract_question(post: &Post) -> String {
@@ -1422,6 +1475,7 @@ async fn build_mention_prompt(
     post: &Post,
     question: &str,
     ancestors: &[(String, String)],
+    meter: Option<&FlowMeter>,
 ) -> String {
     let author = post.author_username();
     let depth_limit = {
@@ -1432,7 +1486,7 @@ async fn build_mention_prompt(
     let above = format_ancestor_chain(ancestors, depth_limit);
 
     let profile = build_user_profile_section(state, author).await;
-    let app_knowledge = build_app_knowledge_section(state, question).await;
+    let app_knowledge = build_app_knowledge_section(state, question, meter).await;
 
     format!(
         "[Post by {author}] {content}\n[Question] {question}{above}{profile}{app_knowledge}",
@@ -1558,7 +1612,11 @@ fn format_user_profile_section(author: &str, facts: &[UserFactPayload]) -> Strin
 /// Tier 3 memory: verified facts about the Things app, injected only when the
 /// question semantically matches them (score-gated), so unrelated
 /// conversations never see app knowledge.
-async fn build_app_knowledge_section(state: &RwLock<AppState>, question: &str) -> String {
+async fn build_app_knowledge_section(
+    state: &RwLock<AppState>,
+    question: &str,
+    meter: Option<&FlowMeter>,
+) -> String {
     let (qdrant, limit, min_score) = {
         let s = state.read().await;
         let runtime = s.runtime.clone();
@@ -1573,6 +1631,9 @@ async fn build_app_knowledge_section(state: &RwLock<AppState>, question: &str) -
         || question.trim().chars().count() < MIN_APP_KNOWLEDGE_QUESTION_CHARS
     {
         return String::new();
+    }
+    if let Some(m) = meter {
+        m.embed(1);
     }
     match qdrant.search_app_knowledge(question, min_score, limit).await {
         Ok(facts) => format_app_knowledge_section(&facts),
@@ -1648,6 +1709,7 @@ async fn build_follow_up_prompt(
     question: &str,
     post_data: &models::PostData,
     conversation_id: u64,
+    meter: Option<&FlowMeter>,
 ) -> String {
     let author = post.author_username();
     let current_id = post.id_value();
@@ -1672,7 +1734,7 @@ async fn build_follow_up_prompt(
     );
 
     let profile = build_user_profile_section(state, author).await;
-    let app_knowledge = build_app_knowledge_section(state, question).await;
+    let app_knowledge = build_app_knowledge_section(state, question, meter).await;
 
     format!(
         "[Follow-up question by {author}] {question}{context}{profile}{app_knowledge}",
@@ -1948,7 +2010,7 @@ fn spawn_extraction_worker(
                 ExtractionTask::Job(job) => {
                     // Snapshot the live config per job (panel edits apply immediately).
                     let config = runtime.read().await.clone();
-                    run_extraction_job(&gemini, &qdrant, &config, job).await;
+                    run_extraction_job(&gemini, &qdrant, &config, job, None).await;
                 }
                 // The channel is FIFO: resolving now means every queued job
                 // ahead of this Flush has completed.
@@ -1966,6 +2028,7 @@ async fn run_extraction_job(
     qdrant: &Arc<QdrantClient>,
     config: &RuntimeConfig,
     job: ExtractionJob,
+    meter: Option<&FlowMeter>,
 ) {
     if !config.memory.fact_extraction_enabled
         || !qdrant.is_available()
@@ -1974,6 +2037,9 @@ async fn run_extraction_job(
         return;
     }
 
+    if let Some(m) = meter {
+        m.gen();
+    }
     let extracted = match gemini.extract_facts(&job.username, &job.text).await {
         Ok(e) => e,
         Err(e) => {
@@ -1987,21 +2053,25 @@ async fn run_extraction_job(
     // Profile scans (posts read during a user lookup) insert at most
     // `user_scan_fact_cap` NEW facts per scan; reinforcement of already-known
     // facts does not count against the cap.
-    let mut new_facts = 0usize;
-    for fact in extracted.user_facts {
+    //
+    // Phase 1: drop noise and reinforce exact restatements in place. A
+    // forgotten or superseded fact stays retired: an exact restatement must
+    // not silently resurrect it (forget is a deliberate user action; a
+    // supersede already has a live replacement fact).
+    struct PendingFact {
+        point_id: uuid::Uuid,
+        text: String,
+        category: Option<String>,
+    }
+    let mut pending: Vec<PendingFact> = Vec::new();
+    for fact in &extracted.user_facts {
         let text = fact.fact.trim();
         if text.chars().count() < 3 || text.chars().count() > MAX_FACT_LENGTH {
             continue;
         }
         let point_id = user_fact_point_id(&job.username, text);
-
-        // Exact restatement -> reinforce the existing point in place.
         match qdrant.get_user_fact(point_id).await {
             Ok(Some(existing)) => {
-                // A forgotten or superseded fact stays retired: an exact
-                // restatement must not silently resurrect it (forget is a
-                // deliberate user action; a supersede already has a live
-                // replacement fact).
                 if existing.active {
                     let patch = serde_json::json!({
                         "last_seen": now,
@@ -2011,33 +2081,52 @@ async fn run_extraction_job(
                         warn!("Failed to reinforce user fact {point_id}: {e}");
                     }
                 }
-                continue;
             }
-            Ok(None) => {}
+            Ok(None) => pending.push(PendingFact {
+                point_id,
+                text: text.to_string(),
+                category: fact.category.clone(),
+            }),
             Err(e) => {
                 warn!("Failed to check user fact {point_id}: {e}");
-                continue;
             }
         }
+    }
 
-        // Profile scans: stop once the cap is hit — BEFORE the supersede
-        // check below, so an over-cap fact never retires an existing one
-        // without inserting its replacement (reinforcing already-known facts
-        // above does not count against the cap).
+    // Phase 2: embed every new candidate in ONE batched call (the supersede
+    // check needs a vector per fact; the upsert re-uses it from the cache).
+    let vectors: Vec<Vec<f32>> = if pending.is_empty() {
+        Vec::new()
+    } else {
+        let texts: Vec<String> = pending.iter().map(|p| p.text.clone()).collect();
+        if let Some(m) = meter {
+            m.embed(texts.len());
+        }
+        match qdrant.embed_texts(&texts).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to batch-embed user facts for {}: {e}", job.username);
+                return;
+            }
+        }
+    };
+
+    // Phase 3: near-duplicate or contradiction -> retire the old fact, keep
+    // the new. The profile-scan cap applies HERE (before supersede), so an
+    // over-cap fact never retires an existing one without inserting its
+    // replacement.
+    let mut new_facts = 0usize;
+    for (candidate, vector) in pending.into_iter().zip(vectors) {
         if job.source == ExtractionSource::ProfileScan
             && new_facts >= config.tools.user_scan_fact_cap
         {
             continue;
         }
-
-        // Near-duplicate or contradiction -> retire the old fact, keep the new.
-        let vector = match qdrant.embed(text).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Failed to embed user fact for {}: {e}", job.username);
-                continue;
-            }
-        };
+        let PendingFact {
+            point_id,
+            text,
+            category,
+        } = candidate;
         match qdrant
             .find_similar_user_fact(
                 &job.username,
@@ -2066,9 +2155,8 @@ async fn run_extraction_job(
 
         let payload = UserFactPayload {
             username: job.username.clone(),
-            fact: text.to_string(),
-            category: fact
-                .category
+            fact: text.clone(),
+            category: category
                 .as_deref()
                 .and_then(FactCategory::parse)
                 .unwrap_or(FactCategory::Other),
@@ -2233,6 +2321,81 @@ fn append_sources_footer(text: &str, sources: &[String]) -> String {
     out
 }
 
+/// Key-failover arms for one reply flow: capped so a 429 storm degrades to
+/// "retry next poll" instead of multiplying the flow's cost by the pool size.
+fn flow_attempt_cap(pool_size: usize, configured: usize) -> usize {
+    pool_size.min(configured).max(1)
+}
+
+/// Section markers injected into prompts (memory, briefings, conversation
+/// logs). A final reply containing any of them means the model recited
+/// scaffold text instead of answering — that must never be posted verbatim.
+const SCAFFOLD_LEAK_MARKERS: &[&str] = &[
+    "[About ",
+    "[Briefing for",
+    "[Conversation so far]",
+    "[Conversation above]",
+    "[Follow-up question",
+    "[Post by",
+    "[Question]",
+    "Saved facts about them",
+    "Their recent posts:",
+];
+
+/// Byte index of the first scaffold marker in `text`, if any.
+fn scaffold_leak_at(text: &str) -> Option<usize> {
+    SCAFFOLD_LEAK_MARKERS
+        .iter()
+        .filter_map(|m| text.find(m))
+        .min()
+}
+
+/// System prompt for the one-shot rewrite used when a reply leaks scaffold.
+const REWRITE_PROMPT: &str = "You are the copy editor for AskMe, a social-network reply bot. \
+The draft reply below accidentally includes raw internal context (memory sections, briefings, \
+fact lists, conversation logs, bracketed section headers). Rewrite it as a natural reply in the \
+SAME language and tone, keeping only the actual answer to the user. Output ONLY the cleaned \
+reply text — no commentary, no section headers, no bracketed labels.";
+
+/// Minimum chars worth keeping after cutting leaked scaffold out of a reply.
+const MIN_STRIPPED_REPLY_CHARS: usize = 20;
+
+/// Guard the final reply against scaffold leakage: clean replies pass through;
+/// a leaking reply gets ONE rewrite pass (extraction model — a mechanical job
+/// that should not burn reply quota); if the rewrite still leaks or fails, cut
+/// everything from the first marker on; if nothing worth keeping remains, the
+/// reply is dropped (Err) so raw context is never posted.
+async fn clean_scaffold_leak(
+    gemini: &GeminiClient,
+    text: String,
+    meter: &FlowMeter,
+) -> Result<String, ()> {
+    if scaffold_leak_at(&text).is_none() {
+        return Ok(text);
+    }
+    warn!("Reply leaked scaffold context; attempting one rewrite pass");
+    meter.gen();
+    match gemini.rewrite_text(REWRITE_PROMPT, &text).await {
+        Ok(clean) if !clean.trim().is_empty() && scaffold_leak_at(&clean).is_none() => {
+            info!("Scaffold leak cleaned by rewrite pass");
+            return Ok(clean);
+        }
+        Ok(_) => warn!("Rewrite pass still contained scaffold; stripping instead"),
+        Err(e) => warn!("Rewrite pass failed ({e}); stripping instead"),
+    }
+    let cut = scaffold_leak_at(&text).unwrap_or(text.len());
+    let stripped = text[..cut].trim().to_string();
+    if stripped.chars().count() >= MIN_STRIPPED_REPLY_CHARS {
+        warn!(
+            "Reply stripped of leaked scaffold ({} chars kept)",
+            stripped.chars().count()
+        );
+        Ok(stripped)
+    } else {
+        Err(())
+    }
+}
+
 /// Media bytes downloaded from Things, staged for the reply flow's upload.
 struct DownloadedMedia {
     data: Vec<u8>,
@@ -2289,7 +2452,13 @@ async fn generate_with_tools_failover(
     media_files: &[DownloadedMedia],
     tool_ctx: &ToolContext,
 ) -> Result<(String, Vec<String>)> {
-    let max_flows = gemini.pool_size().max(1) + 1;
+    // Key-failover arms: each re-runs the whole flow (rounds + uploads), so
+    // an uncapped pool (16 keys) could multiply one reply's cost by 16 in a
+    // 429 storm. A small cap degrades to "retry next poll" instead.
+    let max_flows = flow_attempt_cap(
+        gemini.pool_size(),
+        tool_ctx.runtime.read().await.tools.max_flow_attempts,
+    );
     let mut last_err: Option<anyhow::Error> = None;
     // Profile-scan extraction jobs already flushed at the end of a flow arm,
     // deduped by username across key-failover retries of the same reply.
@@ -2308,6 +2477,7 @@ async fn generate_with_tools_failover(
         let mut file_uris: Vec<(String, String)> = Vec::new();
         let mut rate_limited = false;
         for file in media_files {
+            tool_ctx.meter.upload();
             match gemini
                 .upload_file_with(&lease, &file.data, &file.mime, &file.display_name)
                 .await
@@ -2418,6 +2588,7 @@ async fn run_tool_rounds(
     let mut sources: Vec<String> = Vec::new();
 
     for _ in 0..max_rounds {
+        tool_ctx.meter.gen();
         let turn = match gemini
             .generate_turn_with(lease, system_prompt, contents, &declarations)
             .await
@@ -2429,21 +2600,6 @@ async fn run_tool_rounds(
         sources.extend(turn.retrieved_urls.clone());
 
         if turn.function_calls.is_empty() {
-            // The model is ready to answer, but if it looked up a user this
-            // flow we first make sure its reply can draw on that user's saved
-            // facts and a summary of their posts (fresh facts included).
-            if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
-                // Keep the model's interim turn in the history (role
-                // alternation + its interim text stays visible), then brief.
-                if !turn.raw_parts.is_empty() {
-                    contents.push(Content {
-                        role: "model".to_string(),
-                        parts: turn.raw_parts.clone(),
-                    });
-                }
-                append_user_parts(contents, briefing.parts);
-                continue;
-            }
             match turn.text {
                 Some(t) => return Ok((t, sources)),
                 None => {
@@ -2456,7 +2612,21 @@ async fn run_tool_rounds(
             }
         }
 
-        append_tool_turn(turn, contents, tool_ctx, &mut call_cache).await;
+        let only_cached = append_tool_turn(turn, contents, tool_ctx, &mut call_cache).await;
+
+        // Brief the model on any user it just looked up (saved facts + recent
+        // posts, fresh facts extracted inline) IN THE SAME ROUND, so the next
+        // turn is already the final answer — no extra briefing round.
+        if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
+            append_user_parts(contents, briefing.parts);
+        }
+
+        // Every call this round was an identical repeat of an earlier one —
+        // the model gained nothing new, so further rounds would only repeat.
+        // Skip straight to the final no-tools chance below.
+        if only_cached {
+            break;
+        }
     }
 
     // The round budget is spent but the model still wanted tools. Execute
@@ -2466,6 +2636,7 @@ async fn run_tool_rounds(
     if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
         append_user_parts(contents, briefing.parts);
     }
+    tool_ctx.meter.gen();
     let final_turn = match gemini
         .generate_turn_with(lease, system_prompt, contents, &[])
         .await
@@ -2482,6 +2653,26 @@ async fn run_tool_rounds(
     Err(ToolsFlowError::Failed(anyhow::anyhow!(
         "model exhausted {max_rounds} tool rounds without a final answer"
     )))
+}
+
+/// Resolve a username to a numeric user id via the search API (exact username
+/// match only) — a cheap Things call that lets the briefing fetch posts and
+/// run the inline extraction even when the model only asked for saved facts.
+async fn resolve_user_id_by_username(tool_ctx: &ToolContext, username: &str) -> Option<u64> {
+    match tool_ctx.things.search_users(username, 5).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| {
+                r.username
+                    .as_deref()
+                    .is_some_and(|u| u.eq_ignore_ascii_case(username))
+            })
+            .map(|r| r.id),
+        Err(e) => {
+            warn!("build_user_briefing: could not resolve id for @{username}: {e}");
+            None
+        }
+    }
 }
 
 /// Auto-brief the model on the most recent user it looked up during this
@@ -2540,6 +2731,14 @@ async fn build_user_briefing(gemini: &GeminiClient, tool_ctx: &ToolContext) -> O
     // Posts: reuse the in-flow get_user_posts result, else fetch (bounded).
     let mut posts_value = posts;
     if posts_value.is_none() {
+        // A facts-only subject (get_user_facts lookup) carries no user_id —
+        // resolve it (cheap Things search, no Gemini call) so the briefing
+        // can include posts and run the inline extraction instead of
+        // degrading to facts-only.
+        let user_id = match user_id {
+            Some(id) => Some(id),
+            None => resolve_user_id_by_username(tool_ctx, &username).await,
+        };
         if let Some(id) = user_id {
             if let Ok(page) = tool_ctx
                 .things
@@ -2610,7 +2809,7 @@ async fn build_user_briefing(gemini: &GeminiClient, tool_ctx: &ToolContext) -> O
                 conversation_id: 0,
                 source: ExtractionSource::ProfileScan,
             };
-            run_extraction_job(gemini, &tool_ctx.qdrant, &config, job).await;
+            run_extraction_job(gemini, &tool_ctx.qdrant, &config, job, Some(tool_ctx.meter.as_ref())).await;
         }
     }
 
@@ -2730,12 +2929,16 @@ async fn flush_pending_profile_scans(tool_ctx: &ToolContext, flushed: &mut HashS
 /// A turn with no function calls at all (only server-side toolCall/
 /// toolResponse parts) appends NO user content: an empty `parts` array is
 /// rejected by the API and would kill the whole reply flow.
+///
+/// Returns true when the turn HAD function calls but every one was an
+/// identical repeat (answered with the cached marker, zero fresh executions)
+/// — the model gained nothing new this round.
 async fn append_tool_turn(
     turn: GenerateTurn,
     contents: &mut Vec<Content>,
     tool_ctx: &ToolContext,
     call_cache: &mut HashMap<String, Value>,
-) {
+) -> bool {
     // Append the model's parts verbatim (thought signatures and ids intact).
     // With tool context circulation this must include the server-side
     // toolCall/toolResponse parts, not just the functionCall parts — and even
@@ -2773,6 +2976,7 @@ async fn append_tool_turn(
         }
         scheduled.push((key, call.name.clone(), call.args.clone()));
     }
+    let nothing_new = !turn.function_calls.is_empty() && scheduled.is_empty();
 
     // Execute the unique fresh calls and record their results.
     let mut turn_results: HashMap<String, Value> = HashMap::new();
@@ -2819,6 +3023,7 @@ async fn append_tool_turn(
             parts: response_parts,
         });
     }
+    nothing_new
 }
 
 /// The one-line answer for a call whose full result is already in the history.
@@ -2922,6 +3127,46 @@ mod tests {
         // would risk a duplicate reply.
         let err = anyhow::anyhow!("Reply error (HTTP 500): Internal Server Error");
         assert!(!reply_error_is_safe_to_retry(&err));
+    }
+
+    #[test]
+    fn scaffold_leak_detection() {
+        assert!(scaffold_leak_at("إجابة طبيعية تماماً").is_none());
+        assert!(scaffold_leak_at("a perfectly normal answer").is_none());
+        let leaked = "تفضل:\n[About khalid — long-term memory]\n- lives in Riyadh";
+        assert_eq!(scaffold_leak_at(leaked), Some(leaked.find("[About ").unwrap()));
+        assert!(scaffold_leak_at("Saved facts about them:\n- x").is_some());
+        assert!(scaffold_leak_at("[Conversation so far]\nu: hi").is_some());
+        assert!(scaffold_leak_at("Their recent posts:\n1. hello").is_some());
+        // Earliest marker wins.
+        let both = "[Question] hi\n[Briefing for @x]";
+        assert_eq!(scaffold_leak_at(both), Some(0));
+    }
+
+    #[test]
+    fn extraction_gate_skips_trivial_mentions() {
+        assert!(passes_extraction_gate("وش تعرف عن خالد؟", 0), "0 = extract everything");
+        assert!(!passes_extraction_gate("شكراً", 24));
+        assert!(!passes_extraction_gate("ok 👍", 24));
+        assert!(passes_extraction_gate("اسمي فهد وأسكن في الرياض وأعمل مدرساً", 24));
+        assert!(passes_extraction_gate("   padded question text   ", 10));
+    }
+
+    #[test]
+    fn flow_attempt_cap_bounds_failover_storms() {
+        assert_eq!(flow_attempt_cap(15, 3), 3, "big pool capped to the configured arms");
+        assert_eq!(flow_attempt_cap(2, 3), 2, "small pool caps at pool size");
+        assert_eq!(flow_attempt_cap(0, 3), 1, "empty pool still gets one attempt");
+    }
+
+    #[test]
+    fn flow_meter_counts_and_summarizes() {
+        let m = FlowMeter::default();
+        m.gen();
+        m.gen();
+        m.upload();
+        m.embed(3);
+        assert_eq!(m.summary(), "2 generate, 1 upload, 1 embed (3 texts)");
     }
 
     #[test]
@@ -3236,6 +3481,7 @@ mod tests {
                 user_fact_supersede_threshold: 0.85,
                 forget_similarity_threshold: 0.80,
                 fact_extraction_enabled: true,
+                extraction_min_chars: 24,
             },
             context_depth_limit: 20,
             tools: config::ToolsConfig {
@@ -3246,6 +3492,7 @@ mod tests {
                 user_scan_posts_limit: 10,
                 user_scan_fact_cap: 3,
                 url_context_enabled: true,
+                max_flow_attempts: 3,
             },
         }));
         let extraction_writer =
@@ -3354,6 +3601,7 @@ mod tests {
                     user_fact_supersede_threshold: 0.85,
                     forget_similarity_threshold: 0.80,
                     fact_extraction_enabled: true,
+                    extraction_min_chars: 24,
                 },
                 context_depth_limit: 20,
                 tools: config::ToolsConfig {
@@ -3364,10 +3612,12 @@ mod tests {
                     user_scan_posts_limit: 10,
                     user_scan_fact_cap: 3,
                     url_context_enabled: true,
+                    max_flow_attempts: 3,
                 },
             })),
             tx,
             Arc::new(Mutex::new(Vec::new())),
+            Arc::new(FlowMeter::default()),
         )
     }
 
@@ -3387,6 +3637,7 @@ mod tests {
                 },
                 thought_signature: None,
             }],
+            finish_reason: Some("STOP".to_string()),
         }
     }
 
@@ -3417,6 +3668,7 @@ mod tests {
                     thought_signature: None,
                 },
             ],
+            finish_reason: Some("STOP".to_string()),
         };
         let mut contents = Vec::new();
         let mut cache = HashMap::new();
@@ -3435,7 +3687,8 @@ mod tests {
         let mut contents = Vec::new();
         let mut cache = HashMap::new();
 
-        append_tool_turn(facts_call_turn("call-1"), &mut contents, &ctx, &mut cache).await;
+        let first_fresh = append_tool_turn(facts_call_turn("call-1"), &mut contents, &ctx, &mut cache).await;
+        assert!(!first_fresh, "first execution is fresh, not a cached repeat");
         let Part::FunctionResponse { function_response } = &contents[1].parts[0] else {
             panic!("expected a function response part");
         };
@@ -3445,7 +3698,8 @@ mod tests {
         );
         assert_eq!(function_response.id.as_deref(), Some("call-1"));
 
-        append_tool_turn(facts_call_turn("call-2"), &mut contents, &ctx, &mut cache).await;
+        let only_cached = append_tool_turn(facts_call_turn("call-2"), &mut contents, &ctx, &mut cache).await;
+        assert!(only_cached, "identical repeat executes nothing new");
         let Part::FunctionResponse { function_response } = &contents[3].parts[0] else {
             panic!("expected a function response part");
         };
@@ -3453,8 +3707,7 @@ mod tests {
             function_response.response.get("cached"),
             Some(&json!(true)),
             "repeat of an earlier round gets the marker"
-        );
-        assert!(
+        );        assert!(
             function_response.response.get("error").is_none(),
             "marker replaces the full result, not re-echoes it"
         );

@@ -117,6 +117,9 @@ pub struct GenerateTurn {
     /// circulation into the next request. MUST include toolCall/toolResponse
     /// and all thought signatures when tool context circulation is active.
     pub raw_parts: Vec<Part>,
+    /// The candidate's finish reason (e.g. "STOP", "MAX_TOKENS") — lets the
+    /// caller retry a truncated final answer instead of posting it.
+    pub finish_reason: Option<String>,
 }
 
 /// Parse a generateContent response into a turn: collect every text part,
@@ -206,6 +209,7 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
 
     if raw_parts.is_empty() {
         let reason = finish_reason
+            .clone()
             .or(block_reason)
             .unwrap_or_else(|| "unknown".to_string());
         return Err(AttemptFailure::Fatal(anyhow::anyhow!(
@@ -219,6 +223,7 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
             function_calls,
             retrieved_urls,
             raw_parts,
+            finish_reason,
         });
     }
 
@@ -227,6 +232,7 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
         function_calls,
         retrieved_urls,
         raw_parts,
+        finish_reason,
     })
 }
 
@@ -251,8 +257,11 @@ enum AttemptFailure {
 pub struct GeminiClient {
     client: Client,
     pool: Arc<Mutex<KeyPool>>,
-    /// Chat model used for replies/extraction; hot-swappable (shared across clones).
+    /// Chat model used for replies; hot-swappable (shared across clones).
     generation_model: Arc<std::sync::RwLock<String>>,
+    /// Model for extraction/FAQ/rewrite jobs; None = use generation_model.
+    /// Hot-swappable (shared across clones).
+    extraction_model: Arc<std::sync::RwLock<Option<String>>>,
     /// Gemini 3.x thinking level; None = model default. Hot-swappable.
     thinking_level: Arc<std::sync::RwLock<Option<String>>>,
     embedding_model: String,
@@ -274,6 +283,7 @@ impl GeminiClient {
             vec![api_key],
             crate::config::DEFAULT_GENERATION_MODEL.to_string(),
             None,
+            None,
             crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
             crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
         )
@@ -282,6 +292,7 @@ impl GeminiClient {
     pub fn with_keys(
         api_keys: Vec<String>,
         generation_model: String,
+        extraction_model: Option<String>,
         thinking_level: Option<String>,
         embedding_model: String,
         embedding_dimensions: u32,
@@ -308,6 +319,7 @@ impl GeminiClient {
                 cursor: 0,
             })),
             generation_model: Arc::new(std::sync::RwLock::new(generation_model)),
+            extraction_model: Arc::new(std::sync::RwLock::new(extraction_model)),
             thinking_level: Arc::new(std::sync::RwLock::new(thinking_level)),
             embedding_model,
             embedding_dimensions,
@@ -328,6 +340,24 @@ impl GeminiClient {
     /// The currently active chat model.
     pub fn generation_model(&self) -> String {
         self.generation_model.read().unwrap().clone()
+    }
+
+    /// Hot-swap the extraction model (None = fall back to the chat model).
+    pub fn set_extraction_model(&self, model: Option<String>) {
+        let mut current = self.extraction_model.write().unwrap();
+        if *current != model {
+            info!("Extraction model changed: {:?} -> {:?}", *current, model);
+            *current = model;
+        }
+    }
+
+    /// The effective extraction model: the override when set, else the chat model.
+    pub fn extraction_model(&self) -> String {
+        self.extraction_model
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.generation_model())
     }
 
     /// Hot-swap the thinking level (None = model default; shared across clones).
@@ -734,9 +764,21 @@ impl GeminiClient {
     /// Generate a response constrained to JSON (`responseMimeType`).
     /// Stateless call: rotates per request.
     pub async fn generate_json(&self, system_prompt: &str, user_text: &str) -> Result<String> {
-        self.send_with_rotation(|key: String| async move {
-            self.try_generate(&key, system_prompt, user_text, &[], true)
-                .await
+        let model = self.extraction_model();
+        self.send_with_rotation(|key: String| {
+            let model = model.clone();
+            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], true).await }
+        })
+        .await
+    }
+
+    /// One plain-text rewrite pass (scaffold-leak cleanup), routed to the
+    /// extraction model — a mechanical job that should not burn reply quota.
+    pub async fn rewrite_text(&self, system_prompt: &str, user_text: &str) -> Result<String> {
+        let model = self.extraction_model();
+        self.send_with_rotation(|key: String| {
+            let model = model.clone();
+            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], false).await }
         })
         .await
     }
@@ -754,12 +796,27 @@ impl GeminiClient {
         tools: &[Tool],
     ) -> Result<GenerateTurn, GeminiError> {
         let mut transient_retries = 0u32;
+        let mut max_tokens_retries = 0u32;
         loop {
             match self
                 .try_generate_turn(&lease.key, system_prompt, contents, tools)
                 .await
             {
-                Ok(turn) => return Ok(turn),
+                Ok(turn) => {
+                    // A FINAL answer cut off by the output budget would be
+                    // posted mid-thought — retry it once before accepting.
+                    let truncated_final = turn.function_calls.is_empty()
+                        && turn.finish_reason.as_deref() == Some("MAX_TOKENS");
+                    if truncated_final {
+                        max_tokens_retries += 1;
+                        if max_tokens_retries == 1 {
+                            warn!("generateContent (tools): final answer hit MAX_TOKENS; retrying once");
+                            continue;
+                        }
+                        warn!("generateContent (tools): still MAX_TOKENS after retry; accepting");
+                    }
+                    return Ok(turn);
+                }
                 Err(AttemptFailure::RateLimited { retry_after, daily }) => {
                     self.mark_rate_limited(lease.idx, retry_after, daily);
                     return Err(GeminiError::RateLimited);
@@ -786,10 +843,11 @@ impl GeminiClient {
         }
     }
 
-    /// One generateContent attempt with an explicit key.
+    /// One generateContent attempt with an explicit key and model.
     async fn try_generate(
         &self,
         key: &str,
+        model: &str,
         system_prompt: &str,
         user_text: &str,
         file_uris: &[(String, String)],
@@ -838,7 +896,7 @@ impl GeminiClient {
             },
         };
 
-        let response = self.send_generate(key, request).await?;
+        let response = self.send_generate(key, model, request).await?;
 
         let finish_reason = response
             .candidates
@@ -875,14 +933,15 @@ impl GeminiClient {
         Ok(text)
     }
 
-    /// One generateContent POST with an explicit key, error-classified and
-    /// parsed. Shared by the text-only and the tool-calling paths.
+    /// One generateContent POST with an explicit key and model,
+    /// error-classified and parsed. Shared by the text-only and the
+    /// tool-calling paths.
     async fn send_generate(
         &self,
         key: &str,
+        model: &str,
         request: GenerateContentRequest,
     ) -> Result<GenerateContentResponse, AttemptFailure> {
-        let model = self.generation_model.read().unwrap().clone();
         let url = format!("{GEMINI_API_BASE}/v1beta/models/{model}:generateContent");
 
         let send_result = self
@@ -961,7 +1020,9 @@ impl GeminiClient {
             },
         };
 
-        let response = self.send_generate(key, request).await?;
+        let response = self
+            .send_generate(key, &self.generation_model(), request)
+            .await?;
         parse_turn(response)
     }
 
@@ -1448,9 +1509,22 @@ mod tests {
             (0..n).map(|i| format!("key-{i:04}")).collect(),
             crate::config::DEFAULT_GENERATION_MODEL.to_string(),
             None,
+            None,
             crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
             crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
         )
+    }
+
+    #[test]
+    fn extraction_model_falls_back_to_generation_model() {
+        let client = client_with_keys(1);
+        assert_eq!(client.extraction_model(), client.generation_model());
+        let clone = client.clone();
+        client.set_extraction_model(Some("gemini-3.5-flash-lite".to_string()));
+        assert_eq!(clone.extraction_model(), "gemini-3.5-flash-lite");
+        assert_eq!(clone.generation_model(), crate::config::DEFAULT_GENERATION_MODEL);
+        client.set_extraction_model(None);
+        assert_eq!(clone.extraction_model(), crate::config::DEFAULT_GENERATION_MODEL);
     }
 
     #[test]
