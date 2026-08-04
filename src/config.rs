@@ -278,12 +278,16 @@ impl RuntimeConfig {
                 .app_knowledge_limit
                 .or_else(|| env_u64("APP_KNOWLEDGE_LIMIT"))
                 .unwrap_or(3),
-            // Measured against gemini-embedding-001 with bilingual seeds:
-            // genuine app questions score >=0.73, unrelated short texts <=0.70.
+            // Measured against gemini-embedding-2 @512 with live support
+            // FAQs: genuine app questions score >=0.75 (relevant FAQ facts
+            // >=0.68), unrelated chatter <=0.61 — 0.65 separates both sides
+            // with margin. (The previous 0.72 was tuned on
+            // gemini-embedding-001 and gates out legitimate cross-lingual
+            // FAQ matches.)
             app_knowledge_min_score: overrides
                 .app_knowledge_min_score
                 .or_else(|| env_f32("APP_KNOWLEDGE_MIN_SCORE"))
-                .unwrap_or(0.72),
+                .unwrap_or(0.65),
             user_fact_supersede_threshold: overrides
                 .user_fact_supersede_threshold
                 .or_else(|| env_f32("USER_FACT_SUPERSEDE_THRESHOLD"))
