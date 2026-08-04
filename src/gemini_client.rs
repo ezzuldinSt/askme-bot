@@ -19,6 +19,10 @@ const HTTP_TIMEOUT_SECS: u64 = 120;
 const GENERATE_MAX_ATTEMPTS: u32 = 3;
 /// Default cooldown for a 429 with no parseable RetryInfo.
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
+/// Cooldown for a 400 INVALID_ARGUMENT: long enough to mostly skip sticky
+/// per-project rejections, short enough to probe again soon (and to bound
+/// the cost of a malformed request, which 400s on every key).
+const INVALID_ARGUMENT_COOLDOWN_SECS: u64 = 300;
 /// Max sleep while waiting for a cooled-down key to come back.
 const COOLDOWN_WAIT_CAP_SECS: u64 = 5;
 
@@ -157,13 +161,21 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
     let mut raw_parts: Vec<Part> = Vec::with_capacity(parts.len());
     for part in parts {
         if let Some(t) = part.text {
-            text.push_str(&t);
-            // Text parts can carry thought signatures (sometimes on an EMPTY
-            // text part); circulate them verbatim like every other part type.
-            raw_parts.push(Part::Text {
-                text: t,
-                thought_signature: part.thought_signature.clone(),
-            });
+            // Skip empty text parts with NO thought signature: they carry no
+            // content, and the API rejects them on echo ("empty text
+            // parameter") — a source of intermittent INVALID_ARGUMENTs on
+            // later tool rounds. Empty parts WITH a signature must circulate
+            // (docs: signatures may arrive on empty text parts).
+            if !t.is_empty() || part.thought_signature.is_some() {
+                text.push_str(&t);
+                // Text parts can carry thought signatures (sometimes on an
+                // EMPTY text part); circulate them verbatim like every other
+                // part type.
+                raw_parts.push(Part::Text {
+                    text: t,
+                    thought_signature: part.thought_signature.clone(),
+                });
+            }
         }
         if let Some(fc) = part.function_call {
             function_calls.push(FunctionCallTurn {
@@ -224,6 +236,11 @@ enum AttemptFailure {
     RateLimited { retry_after: Duration, daily: bool },
     /// 401/403 — the key is invalid; mark it dead.
     Dead(String),
+    /// 400 INVALID_ARGUMENT — either the key's project rejects the request
+    /// (e.g. model not enabled — sticky per key) or the request itself is
+    /// malformed (same on every key). Cool the key briefly and fail over;
+    /// if every key 400s, the error still surfaces, just slower.
+    InvalidArgument(anyhow::Error),
     /// 5xx or transport error — worth a bounded backoff (not key-related).
     Transient(anyhow::Error),
     /// Other 4xx — the request itself is broken; never retry.
@@ -455,6 +472,21 @@ impl GeminiClient {
         }
     }
 
+    /// Cool a key down WITHOUT touching its 429 counter — used for 400
+    /// INVALID_ARGUMENT rejections (sticky per-project, or a request bug
+    /// that will show up on every key anyway).
+    fn cool_key(&self, idx: usize, dur: Duration, why: &str) {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(k) = pool.keys.get_mut(idx) {
+            k.cooldown_until = Some(Instant::now() + dur);
+            warn!(
+                "Gemini key {} rejected the request ({why}); cooling down for {}s",
+                mask_key(&k.key),
+                dur.as_secs()
+            );
+        }
+    }
+
     /// Sleep until the earliest cooled-down key is due back (bounded).
     pub async fn wait_for_cooldown(&self) {
         let wake = {
@@ -487,6 +519,7 @@ impl GeminiClient {
     {
         let max_attempts = self.pool_size().max(2) + GENERATE_MAX_ATTEMPTS as usize;
         let mut transient_retries = 0u32;
+        let mut last_invalid: Option<anyhow::Error> = None;
         for _ in 0..max_attempts {
             let Some((idx, key)) = self.acquire() else {
                 self.wait_for_cooldown().await;
@@ -500,6 +533,10 @@ impl GeminiClient {
                 Err(AttemptFailure::Dead(reason)) => {
                     self.mark_dead(idx, reason);
                 }
+                Err(AttemptFailure::InvalidArgument(e)) => {
+                    self.cool_key(idx, Duration::from_secs(INVALID_ARGUMENT_COOLDOWN_SECS), "400 INVALID_ARGUMENT");
+                    last_invalid = Some(e);
+                }
                 Err(AttemptFailure::Transient(e)) => {
                     transient_retries += 1;
                     if transient_retries >= GENERATE_MAX_ATTEMPTS {
@@ -511,9 +548,9 @@ impl GeminiClient {
                 Err(AttemptFailure::Fatal(e)) => return Err(e),
             }
         }
-        Err(anyhow::anyhow!(
-            "all Gemini API keys are currently rate-limited or dead"
-        ))
+        Err(last_invalid.unwrap_or_else(|| {
+            anyhow::anyhow!("all Gemini API keys are currently rate-limited or dead")
+        }))
     }
 
     // ── Files API (lease-based: files are project-scoped) ──
@@ -538,6 +575,11 @@ impl GeminiClient {
             }
             Err(AttemptFailure::Dead(reason)) => {
                 self.mark_dead(lease.idx, reason);
+                Err(GeminiError::RateLimited)
+            }
+            Err(AttemptFailure::InvalidArgument(e)) => {
+                self.cool_key(lease.idx, Duration::from_secs(INVALID_ARGUMENT_COOLDOWN_SECS), "400 INVALID_ARGUMENT");
+                warn!("Upload rejected (failing over): {e}");
                 Err(GeminiError::RateLimited)
             }
             Err(AttemptFailure::Transient(e)) | Err(AttemptFailure::Fatal(e)) => {
@@ -724,6 +766,11 @@ impl GeminiClient {
                 }
                 Err(AttemptFailure::Dead(reason)) => {
                     self.mark_dead(lease.idx, reason);
+                    return Err(GeminiError::RateLimited);
+                }
+                Err(AttemptFailure::InvalidArgument(e)) => {
+                    self.cool_key(lease.idx, Duration::from_secs(INVALID_ARGUMENT_COOLDOWN_SECS), "400 INVALID_ARGUMENT");
+                    warn!("generateContent rejected (failing over): {e}");
                     return Err(GeminiError::RateLimited);
                 }
                 Err(AttemptFailure::Transient(e)) => {
@@ -1087,6 +1134,11 @@ fn classify_http_failure(status: StatusCode, body: &[u8]) -> AttemptFailure {
         return AttemptFailure::Dead(format!("HTTP {status}: API key not valid"));
     }
     let err = anyhow::anyhow!("Gemini API error (HTTP {status}): {}", truncate(&text, 400));
+    if status == StatusCode::BAD_REQUEST {
+        // Cool the key briefly and fail over: covers both sticky per-project
+        // rejections and (slower, but still surfaced) malformed requests.
+        return AttemptFailure::InvalidArgument(err);
+    }
     if status.is_server_error() {
         AttemptFailure::Transient(err)
     } else {
@@ -1338,6 +1390,57 @@ mod tests {
         assert!(turn.retrieved_urls.is_empty());
     }
 
+    #[test]
+    fn parse_turn_skips_empty_text_without_signature_keeps_signed() {
+        // An empty, unsigned text part must not circulate (the API rejects it
+        // on echo); an empty part WITH a thought signature must circulate.
+        let raw = r#"{
+            "candidates": [{
+                "content": { "parts": [
+                    {"text": ""},
+                    {"text": "", "thoughtSignature": "sig-1"},
+                    {"text": "real answer"}
+                ], "role": "model" }
+            }]
+        }"#;
+        let response: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let turn = parse_turn(response).unwrap_or_else(|_| panic!("turn parses"));
+        assert_eq!(turn.text.as_deref(), Some("real answer"));
+        assert_eq!(turn.raw_parts.len(), 2, "unsigned empty part dropped");
+        assert!(
+            matches!(&turn.raw_parts[0], Part::Text { text, thought_signature }
+                if text.is_empty() && thought_signature.as_deref() == Some("sig-1")),
+            "signed empty part circulated with its signature"
+        );
+        assert!(
+            matches!(&turn.raw_parts[1], Part::Text { text, .. } if text == "real answer"),
+        );
+    }
+
+    #[test]
+    fn classify_400_invalid_argument_fails_over_not_fatal() {
+        assert!(matches!(
+            classify_http_failure(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}"#
+            ),
+            AttemptFailure::InvalidArgument(_)
+        ));
+        // A bad key is still Dead, never cooled-and-retried.
+        assert!(matches!(
+            classify_http_failure(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#
+            ),
+            AttemptFailure::Dead(_)
+        ));
+        // Other 4xx stay Fatal.
+        assert!(matches!(
+            classify_http_failure(StatusCode::NOT_FOUND, b"nope"),
+            AttemptFailure::Fatal(_)
+        ));
+    }
+
     // ── key pool ──
 
     fn client_with_keys(n: usize) -> GeminiClient {
@@ -1528,8 +1631,15 @@ mod tests {
             classify_http_failure(StatusCode::INTERNAL_SERVER_ERROR, b"boom"),
             AttemptFailure::Transient(_)
         ));
+        // Plain 400: cool the key and fail over (per-project rejection or
+        // malformed request), no longer Fatal.
         assert!(matches!(
             classify_http_failure(StatusCode::BAD_REQUEST, b"bad request"),
+            AttemptFailure::InvalidArgument(_)
+        ));
+        // Non-400 4xx stays Fatal.
+        assert!(matches!(
+            classify_http_failure(StatusCode::UNPROCESSABLE_ENTITY, b"bad request"),
             AttemptFailure::Fatal(_)
         ));
     }

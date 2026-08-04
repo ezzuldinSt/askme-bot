@@ -118,7 +118,9 @@ fn http_error(status: StatusCode, context: &str, body: &[u8]) -> RequestError {
     if status == StatusCode::UNAUTHORIZED {
         return RequestError::AuthExpired;
     }
-    let text = String::from_utf8_lossy(body);
+    // Error pages (404/500 HTML) can be kilobytes of markup; tool-facing
+    // errors are fed back to the model, so keep only a snippet.
+    let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
     let err = anyhow::anyhow!("{context} (HTTP {status}): {text}");
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         RequestError::Retryable(err)
