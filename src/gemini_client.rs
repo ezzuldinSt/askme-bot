@@ -91,6 +91,128 @@ pub enum GeminiError {
     Failed(anyhow::Error),
 }
 
+/// A function call requested by the model during a tool-calling turn. The
+/// thought signature and call id live in `GenerateTurn::raw_parts` and are
+/// circulated verbatim; this struct only drives execution.
+#[derive(Debug, Clone)]
+pub struct FunctionCallTurn {
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// The result of one tool-calling generateContent turn: either a final text
+/// answer (`function_calls` empty) or one-or-more calls to execute.
+#[derive(Debug, Clone)]
+pub struct GenerateTurn {
+    pub text: Option<String>,
+    pub function_calls: Vec<FunctionCallTurn>,
+    /// URLs the URL context tool successfully fetched this turn (the answer
+    /// may be based on them; the reply flow appends them as a Sources footer).
+    pub retrieved_urls: Vec<String>,
+    /// Every part of the candidate's model-role content, re-serialized for
+    /// circulation into the next request. MUST include toolCall/toolResponse
+    /// and all thought signatures when tool context circulation is active.
+    pub raw_parts: Vec<Part>,
+}
+
+/// Parse a generateContent response into a turn: collect every text part,
+/// every functionCall (with its thought signature), and every server-side
+/// toolCall/toolResponse part (preserved for tool context circulation). A
+/// candidate with NO parts at all is a generation failure, not a valid turn.
+fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, AttemptFailure> {
+    let finish_reason = response
+        .candidates
+        .as_ref()
+        .and_then(|c| c.first())
+        .and_then(|c| c.finishReason.as_deref())
+        .map(|s| s.to_string());
+    let block_reason = response
+        .promptFeedback
+        .as_ref()
+        .and_then(|f| f.blockReason.as_deref())
+        .map(|s| s.to_string());
+
+    let candidate = response
+        .candidates
+        .and_then(|c| c.into_iter().next())
+        .ok_or_else(|| {
+            AttemptFailure::Fatal(anyhow::anyhow!("Gemini returned no candidate"))
+        })?;
+    let retrieved_urls = candidate
+        .url_context_metadata
+        .as_ref()
+        .and_then(|m| m.url_metadata.as_ref())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.url_retrieval_status.as_deref() == Some("URL_RETRIEVAL_STATUS_SUCCESS"))
+                .filter_map(|e| e.retrieved_url.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let parts = candidate.content.and_then(|c| c.parts).unwrap_or_default();
+
+    let mut text = String::new();
+    let mut function_calls: Vec<FunctionCallTurn> = Vec::new();
+    let mut raw_parts: Vec<Part> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if let Some(t) = part.text {
+            text.push_str(&t);
+            raw_parts.push(Part::Text { text: t });
+        }
+        if let Some(fc) = part.function_call {
+            function_calls.push(FunctionCallTurn {
+                name: fc.name.clone(),
+                args: fc.args.clone(),
+            });
+            raw_parts.push(Part::FunctionCall {
+                function_call: fc,
+                thought_signature: part.thought_signature.clone(),
+            });
+        }
+        if let Some(fr) = part.function_response {
+            raw_parts.push(Part::FunctionResponse { function_response: fr });
+        }
+        if let Some(tc) = part.tool_call {
+            raw_parts.push(Part::ToolCall {
+                tool_call: tc,
+                thought_signature: part.thought_signature.clone(),
+            });
+        }
+        if let Some(tr) = part.tool_response {
+            raw_parts.push(Part::ToolResponse {
+                tool_response: tr,
+                thought_signature: part.thought_signature.clone(),
+            });
+        }
+    }
+
+    if raw_parts.is_empty() {
+        let reason = finish_reason
+            .or(block_reason)
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(AttemptFailure::Fatal(anyhow::anyhow!(
+            "Gemini returned an empty response (reason: {reason})"
+        )));
+    }
+
+    if function_calls.is_empty() {
+        return Ok(GenerateTurn {
+            text: (!text.trim().is_empty()).then_some(text),
+            function_calls,
+            retrieved_urls,
+            raw_parts,
+        });
+    }
+
+    Ok(GenerateTurn {
+        text: (!text.trim().is_empty()).then_some(text),
+        function_calls,
+        retrieved_urls,
+        raw_parts,
+    })
+}
+
 /// How a single API attempt failed (internal classification).
 enum AttemptFailure {
     /// 429 — cool the key down (or park it for the day).
@@ -562,23 +684,35 @@ impl GeminiClient {
 
     // ── GenerateContent ──
 
-    /// Generate using a lease's key. 429/401/403 mark the key and return
-    /// `GeminiError::RateLimited` so the flow can re-lease; transient errors
-    /// get a bounded same-key backoff before giving up.
-    pub async fn generate_content_with(
+    /// Generate a response constrained to JSON (`responseMimeType`).
+    /// Stateless call: rotates per request.
+    pub async fn generate_json(&self, system_prompt: &str, user_text: &str) -> Result<String> {
+        self.send_with_rotation(|key: String| async move {
+            self.try_generate(&key, system_prompt, user_text, &[], true)
+                .await
+        })
+        .await
+    }
+
+    /// One tool-calling round on the lease's key: sends the contents history
+    /// plus tool declarations and returns the model's turn (text or calls).
+    /// 429/401/403 mark the key and return `GeminiError::RateLimited`; transient
+    /// errors get the same bounded same-key backoff as the text path. The tool
+    /// loop (in the caller) holds the lease across rounds.
+    pub async fn generate_turn_with(
         &self,
         lease: &KeyLease,
         system_prompt: &str,
-        user_text: &str,
-        file_uris: &[(String, String)],
-    ) -> Result<String, GeminiError> {
+        contents: &[Content],
+        tools: &[Tool],
+    ) -> Result<GenerateTurn, GeminiError> {
         let mut transient_retries = 0u32;
         loop {
             match self
-                .try_generate(&lease.key, system_prompt, user_text, file_uris, false)
+                .try_generate_turn(&lease.key, system_prompt, contents, tools)
                 .await
             {
-                Ok(text) => return Ok(text),
+                Ok(turn) => return Ok(turn),
                 Err(AttemptFailure::RateLimited { retry_after, daily }) => {
                     self.mark_rate_limited(lease.idx, retry_after, daily);
                     return Err(GeminiError::RateLimited);
@@ -592,22 +726,12 @@ impl GeminiClient {
                     if transient_retries >= GENERATE_MAX_ATTEMPTS {
                         return Err(GeminiError::Failed(e));
                     }
-                    warn!("generateContent transient error (retry {transient_retries}): {e}");
+                    warn!("generateContent (tools) transient error (retry {transient_retries}): {e}");
                     sleep(backoff(transient_retries)).await;
                 }
                 Err(AttemptFailure::Fatal(e)) => return Err(GeminiError::Failed(e)),
             }
         }
-    }
-
-    /// Generate a response constrained to JSON (`responseMimeType`).
-    /// Stateless call: rotates per request.
-    pub async fn generate_json(&self, system_prompt: &str, user_text: &str) -> Result<String> {
-        self.send_with_rotation(|key: String| async move {
-            self.try_generate(&key, system_prompt, user_text, &[], true)
-                .await
-        })
-        .await
     }
 
     /// One generateContent attempt with an explicit key.
@@ -644,6 +768,8 @@ impl GeminiClient {
                 role: "user".to_string(),
                 parts,
             }],
+            tools: None,
+            tool_config: None,
             generation_config: {
                 let thinking_level = self.thinking_level.read().unwrap().clone();
                 if json_mode || thinking_level.is_some() {
@@ -658,43 +784,7 @@ impl GeminiClient {
             },
         };
 
-        let model = self.generation_model.read().unwrap().clone();
-        let url = format!("{GEMINI_API_BASE}/v1beta/models/{model}:generateContent");
-
-        let send_result = self
-            .client
-            .post(&url)
-            .header("x-goog-api-key", key)
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await;
-
-        let resp = match send_result {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(AttemptFailure::Transient(
-                    anyhow::Error::new(e).context("Failed to send generateContent request"),
-                ))
-            }
-        };
-
-        let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| {
-            AttemptFailure::Transient(
-                anyhow::Error::new(e).context("Failed to read Gemini response body"),
-            )
-        })?;
-
-        if !status.is_success() {
-            return Err(classify_http_failure(status, &bytes));
-        }
-
-        let response: GenerateContentResponse = serde_json::from_slice(&bytes).map_err(|e| {
-            AttemptFailure::Fatal(
-                anyhow::Error::new(e).context("Failed to parse Gemini generateContent response"),
-            )
-        })?;
+        let response = self.send_generate(key, request).await?;
 
         let finish_reason = response
             .candidates
@@ -729,6 +819,95 @@ impl GeminiClient {
         }
 
         Ok(text)
+    }
+
+    /// One generateContent POST with an explicit key, error-classified and
+    /// parsed. Shared by the text-only and the tool-calling paths.
+    async fn send_generate(
+        &self,
+        key: &str,
+        request: GenerateContentRequest,
+    ) -> Result<GenerateContentResponse, AttemptFailure> {
+        let model = self.generation_model.read().unwrap().clone();
+        let url = format!("{GEMINI_API_BASE}/v1beta/models/{model}:generateContent");
+
+        let send_result = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", key)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await;
+
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(AttemptFailure::Transient(
+                    anyhow::Error::new(e).context("Failed to send generateContent request"),
+                ))
+            }
+        };
+
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| {
+            AttemptFailure::Transient(
+                anyhow::Error::new(e).context("Failed to read Gemini response body"),
+            )
+        })?;
+
+        if !status.is_success() {
+            return Err(classify_http_failure(status, &bytes));
+        }
+
+        serde_json::from_slice(&bytes).map_err(|e| {
+            AttemptFailure::Fatal(
+                anyhow::Error::new(e).context("Failed to parse Gemini generateContent response"),
+            )
+        })
+    }
+
+    /// One tool-calling generateContent attempt: sends the full contents
+    /// history plus the tool declarations, and returns whatever the model
+    /// produced — a final text answer, or one-or-more function calls.
+    async fn try_generate_turn(
+        &self,
+        key: &str,
+        system_prompt: &str,
+        contents: &[Content],
+        tools: &[Tool],
+    ) -> Result<GenerateTurn, AttemptFailure> {
+        // Built-in tools (url_context) combined with function declarations
+        // require server-side tool context circulation: without the flag the
+        // API rejects the request (400 INVALID_ARGUMENT).
+        let has_builtin_tool = tools.iter().any(|t| t.url_context.is_some());
+        let request = GenerateContentRequest {
+            system_instruction: Some(SystemInstruction {
+                parts: vec![Part::Text {
+                    text: system_prompt.to_string(),
+                }],
+            }),
+            contents: contents.to_vec(),
+            tools: (!tools.is_empty()).then(|| tools.to_vec()),
+            tool_config: has_builtin_tool.then(|| ToolConfig {
+                include_server_side_tool_invocations: true,
+            }),
+            generation_config: {
+                let thinking_level = self.thinking_level.read().unwrap().clone();
+                if thinking_level.is_some() {
+                    Some(GenerationConfig {
+                        response_mime_type: None,
+                        thinking_config: thinking_level
+                            .map(|level| ThinkingConfig { thinking_level: level }),
+                    })
+                } else {
+                    None
+                }
+            },
+        };
+
+        let response = self.send_generate(key, request).await?;
+        parse_turn(response)
     }
 
     // ── Embeddings ──
@@ -1111,6 +1290,43 @@ mod tests {
         assert!(parse_extracted_facts("{broken").user_facts.is_empty());
     }
 
+    // ── URL context metadata ──
+
+    #[test]
+    fn parse_turn_collects_successful_url_context_retrievals() {
+        let raw = r#"{
+            "candidates": [{
+                "content": { "parts": [{"text": "answered from the page"}], "role": "model" },
+                "urlContextMetadata": {
+                    "urlMetadata": [
+                        {"retrievedUrl": "https://ok.example", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"},
+                        {"retrievedUrl": "https://fail.example", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_ERROR"},
+                        {"retrievedUrl": "https://ok2.example", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}
+                    ]
+                }
+            }]
+        }"#;
+        let response: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let turn = parse_turn(response).unwrap_or_else(|_| panic!("turn parses"));
+        assert_eq!(turn.text.as_deref(), Some("answered from the page"));
+        assert_eq!(
+            turn.retrieved_urls,
+            vec!["https://ok.example".to_string(), "https://ok2.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_turn_without_metadata_has_empty_sources() {
+        let raw = r#"{
+            "candidates": [{
+                "content": { "parts": [{"text": "plain answer"}], "role": "model" }
+            }]
+        }"#;
+        let response: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let turn = parse_turn(response).unwrap_or_else(|_| panic!("turn parses"));
+        assert!(turn.retrieved_urls.is_empty());
+    }
+
     // ── key pool ──
 
     fn client_with_keys(n: usize) -> GeminiClient {
@@ -1305,5 +1521,98 @@ mod tests {
             classify_http_failure(StatusCode::BAD_REQUEST, b"bad request"),
             AttemptFailure::Fatal(_)
         ));
+    }
+
+    /// LIVE verification that url_context + function declarations coexist in
+    /// one generateContent request AND that server-side tool parts circulate
+    /// across rounds (the bot's tool loop shape). Run manually:
+    /// `GEMINI_API_KEY=... cargo test url_context_and_functions_coexist -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn url_context_and_functions_coexist() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let client = GeminiClient::new(key);
+        let lease = client.acquire_lease().expect("lease");
+        let tools = vec![
+            crate::models::Tool::url_context(),
+            crate::models::Tool {
+                function_declarations: vec![crate::models::FunctionDeclaration {
+                    name: "get_fact".to_string(),
+                    description: "Look up a saved fact by query string.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"],
+                    }),
+                }],
+                url_context: None,
+            },
+        ];
+        let mut contents = vec![crate::models::Content {
+            role: "user".to_string(),
+            parts: vec![crate::models::Part::Text {
+                text: "What is the main heading of https://en.wikipedia.org/wiki/UEFA_Euro_2024_final ? \
+                       Then call get_fact with query \"euro\". Answer in one sentence after the tool result."
+                    .to_string(),
+            }],
+        }];
+        let mut sources: Vec<String> = Vec::new();
+        for _round in 0..3 {
+            let turn = client
+                .generate_turn_with(&lease, "You are a helpful assistant.", &contents, &tools)
+                .await
+                .expect("live generateContent with url_context + functions");
+            println!(
+                "round {_round}: text={:?} calls={:?} urls={:?} parts={}",
+                turn.text,
+                turn.function_calls.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                turn.retrieved_urls,
+                turn.raw_parts.len(),
+            );
+            sources.extend(turn.retrieved_urls.clone());
+            if turn.function_calls.is_empty() {
+                let text = turn.text.expect("final answer text");
+                assert!(
+                    text.to_lowercase().contains("final"),
+                    "final answer must reflect the canned tool result"
+                );
+                assert!(
+                    sources.iter().any(|u| u.contains("wikipedia")),
+                    "url_context retrieval must be reported: {sources:?}"
+                );
+                return;
+            }
+            contents.push(crate::models::Content {
+                role: "model".to_string(),
+                parts: turn.raw_parts.clone(),
+            });
+            let mut responses: Vec<crate::models::Part> = Vec::new();
+            for call in &turn.function_calls {
+                let id = turn
+                    .raw_parts
+                    .iter()
+                    .find_map(|p| match p {
+                        crate::models::Part::FunctionCall { function_call, .. }
+                            if function_call.name == call.name =>
+                        {
+                            function_call.id.clone()
+                        }
+                        _ => None,
+                    });
+                println!("  executing {} id={id:?}", call.name);
+                responses.push(crate::models::Part::FunctionResponse {
+                    function_response: crate::models::FunctionResponseData {
+                        name: call.name.clone(),
+                        response: serde_json::json!({ "fact": "euro 2024 final was played in Berlin" }),
+                        id,
+                    },
+                });
+            }
+            contents.push(crate::models::Content {
+                role: "user".to_string(),
+                parts: responses,
+            });
+        }
+        panic!("loop never produced a final answer");
     }
 }

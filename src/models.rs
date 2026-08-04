@@ -61,6 +61,77 @@ pub struct Notification {
     pub action_url: Option<String>,
 }
 
+// ── Things API Users ──
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsersEnvelope {
+    pub data: Option<Vec<UserSearchRow>>,
+}
+
+/// One row of `GET /users?search=...` — already includes the bio, so a
+/// username search doubles as a lightweight profile lookup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserSearchRow {
+    pub id: u64,
+    pub username: Option<String>,
+    pub name: Option<String>,
+    pub bio: Option<String>,
+    pub is_private: Option<bool>,
+    pub is_verified: Option<bool>,
+    pub is_premium: Option<bool>,
+    pub streak: Option<u64>,
+}
+
+/// Full profile from `GET /user/{id}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserProfile {
+    pub id: u64,
+    pub username: Option<String>,
+    pub name: Option<String>,
+    pub bio: Option<String>,
+    pub joined_at: Option<String>,
+    pub is_private: Option<bool>,
+    pub is_verified: Option<bool>,
+    pub is_premium: Option<bool>,
+    pub streak: Option<u64>,
+    #[serde(rename = "sticky_status")]
+    pub sticky_status: Option<String>,
+}
+
+/// Cursor-paginated page of `GET /user/{id}/posts`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserPostsPage {
+    pub data: Option<Vec<UserPostRow>>,
+    pub next_cursor: Option<String>,
+    #[serde(rename = "has_more")]
+    pub has_more: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserPostRow {
+    pub id: u64,
+    #[serde(default)]
+    pub post_comment: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub comments: Option<String>,
+    pub user: Option<User>,
+    pub parent_id: Option<u64>,
+    pub post_type: Option<String>,
+    pub created_at: Option<String>,
+}
+
+impl UserPostRow {
+    pub fn content_text(&self) -> &str {
+        self.post_comment
+            .as_deref()
+            .or(self.content.as_deref())
+            .or(self.comments.as_deref())
+            .unwrap_or("")
+    }
+}
+
 // ── Things API Posts ──
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +157,7 @@ pub struct Post {
     pub audio: Option<serde_json::Value>,
     pub post_type: Option<String>,
     pub created_at: Option<String>,
+    pub expires_at: Option<String>,
     pub content: Option<String>,
     pub comments: Option<String>,
     pub images: Option<Vec<MediaItem>>,
@@ -143,6 +215,9 @@ pub struct PostEntity {
     pub color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size_value: Option<String>,
+    /// Language tag for `code_block` entities (e.g. "rust", "arduino").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +269,83 @@ pub struct GeminiFileStateResponse {
     pub error: Option<GeminiFileError>,
 }
 
+// ── Gemini Tool Calling ──
+
+/// A function call requested by the model (response) or echoed back into
+/// history (request). `args` is the JSON argument object. `id` links the call
+/// to its response and MUST be echoed back verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallData {
+    pub name: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// The result of executing a model-requested function call, sent back as a
+/// user-role part so the model can reason over the outcome. Echoes the call's
+/// `id` when the API provided one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionResponseData {
+    pub name: String,
+    pub response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// A server-side built-in tool invocation (url_context, google_search, ...)
+/// surfaced when `toolConfig.includeServerSideToolInvocations` is set. The
+/// server executes the tool itself; the app only circulates the parts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallData {
+    #[serde(rename = "toolType")]
+    pub tool_type: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    pub id: Option<String>,
+}
+
+/// The server's result for a server-side tool invocation, paired with its
+/// `toolCall` by `id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResponseData {
+    #[serde(rename = "toolType")]
+    pub tool_type: String,
+    #[serde(default)]
+    pub response: serde_json::Value,
+    pub id: Option<String>,
+}
+
+/// One function the model may call (see ai.google.dev/gemini-api/docs/
+/// function-calling). `parameters` is a JSON Schema object.
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionDeclaration {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Tool {
+    #[serde(rename = "functionDeclarations", skip_serializing_if = "Vec::is_empty")]
+    pub function_declarations: Vec<FunctionDeclaration>,
+    /// The built-in URL context tool: the model auto-fetches http(s) URLs
+    /// present in the conversation. Takes no arguments — URLs come from the
+    /// prompt. Serializes as `{"urlContext": {}}` when set.
+    #[serde(rename = "urlContext", skip_serializing_if = "Option::is_none")]
+    pub url_context: Option<serde_json::Value>,
+}
+
+impl Tool {
+    pub fn url_context() -> Self {
+        Self {
+            function_declarations: Vec::new(),
+            url_context: Some(serde_json::json!({})),
+        }
+    }
+}
+
 // ── Gemini GenerateContent API ──
 
 #[derive(Debug, Serialize)]
@@ -201,8 +353,21 @@ pub struct GenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<SystemInstruction>,
     pub contents: Vec<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ToolConfig>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
+}
+
+/// `includeServerSideToolInvocations` is REQUIRED whenever built-in tools
+/// (url_context, ...) are combined with function declarations: it surfaces the
+/// server-side `toolCall`/`toolResponse` parts so the app can circulate them.
+#[derive(Debug, Serialize)]
+pub struct ToolConfig {
+    #[serde(rename = "includeServerSideToolInvocations")]
+    pub include_server_side_tool_invocations: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,27 +390,55 @@ pub struct SystemInstruction {
     pub parts: Vec<Part>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Content {
     pub role: String,
     pub parts: Vec<Part>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Part {
     Text { text: String },
     FileData { file_data: FileData },
     InlineData { inline_data: InlineData },
+    /// Echo of a model functionCall back into history. Thinking models attach
+    /// a `thoughtSignature` that MUST be echoed verbatim on the way back.
+    FunctionCall {
+        #[serde(rename = "functionCall")]
+        function_call: FunctionCallData,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: FunctionResponseData,
+    },
+    /// Server-side built-in tool invocation, circulated back into history
+    /// verbatim (with its thought signature).
+    ToolCall {
+        #[serde(rename = "toolCall")]
+        tool_call: ToolCallData,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    /// Server-side tool result, circulated back into history verbatim
+    /// (tool responses carry their own thought signature).
+    ToolResponse {
+        #[serde(rename = "toolResponse")]
+        tool_response: ToolResponseData,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileData {
     pub mime_type: String,
     pub file_uri: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InlineData {
     pub mime_type: String,
     pub data: String,
@@ -263,6 +456,23 @@ pub struct Candidate {
     pub content: Option<ContentResponse>,
     pub finishReason: Option<String>,
     pub safetyRatings: Option<Vec<SafetyRating>>,
+    /// Which URLs the URL context tool retrieved this turn, with per-URL status.
+    #[serde(rename = "urlContextMetadata")]
+    pub url_context_metadata: Option<UrlContextMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UrlContextMetadata {
+    #[serde(rename = "urlMetadata")]
+    pub url_metadata: Option<Vec<UrlMetadataEntry>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UrlMetadataEntry {
+    #[serde(rename = "retrievedUrl")]
+    pub retrieved_url: Option<String>,
+    #[serde(rename = "urlRetrievalStatus")]
+    pub url_retrieval_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +484,16 @@ pub struct ContentResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartResponse {
     pub text: Option<String>,
+    #[serde(rename = "functionCall")]
+    pub function_call: Option<FunctionCallData>,
+    #[serde(rename = "functionResponse")]
+    pub function_response: Option<FunctionResponseData>,
+    #[serde(rename = "toolCall")]
+    pub tool_call: Option<ToolCallData>,
+    #[serde(rename = "toolResponse")]
+    pub tool_response: Option<ToolResponseData>,
+    #[serde(rename = "thoughtSignature")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

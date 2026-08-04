@@ -5,13 +5,16 @@ mod gemini_client;
 mod models;
 mod qdrant_client;
 mod qdrant_models;
+mod search;
 mod things_client;
+mod tools;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use serde_json::{json, Value};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
@@ -20,8 +23,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::RuntimeConfig;
 use crate::entities::build_reply_with_entities;
-use crate::gemini_client::{GeminiClient, GeminiError};
-use crate::models::{Notification, Post};
+use crate::gemini_client::{GeminiClient, GeminiError, GenerateTurn, KeyLease};
+use crate::models::{
+    Content, FileData, FunctionResponseData, Notification, Part, Post,
+};
 use crate::qdrant_client::{MemoryWrite, QdrantClient};
 use crate::qdrant_models::{
     app_fact_point_id, user_fact_point_id, AppFactPayload, AppFactSource, AppFactStatus,
@@ -29,10 +34,13 @@ use crate::qdrant_models::{
     PROCESSED_COLLECTION_NAME, THINGS_KNOWLEDGE_COLLECTION_NAME, USER_PROFILES_COLLECTION_NAME,
 };
 use crate::things_client::{is_auth_expired, ThingsClient, TOKEN_FILE};
+use crate::tools::{
+    tool_declarations, ExtractionJob, ExtractionSource, FlowSubject, ToolContext,
+};
 
 const BOT_USERNAME: &str = "AskMe";
 const POLL_INTERVAL_MS: u64 = 3_000;
-const MAX_RESPONSE_LENGTH: usize = 500;
+const MAX_RESPONSE_LENGTH: usize = 8000;
 const MAX_CONTEXT_DEPTH: usize = 20;
 const MAX_MEDIA_FILES: usize = 5;
 const MEMORY_WRITE_BATCH_SIZE: usize = 5;
@@ -53,15 +61,8 @@ const MAX_FACT_LENGTH: usize = 300;
 /// one-word question ("Hi", "Thanks") has diffuse semantics and matches
 /// everything, while a genuine app question always names the app.
 const MIN_APP_KNOWLEDGE_QUESTION_CHARS: usize = 12;
-
-/// A user message queued for the background fact-extraction pass.
-struct ExtractionJob {
-    username: String,
-    /// The user's message text (mention already stripped).
-    text: String,
-    post_id: u64,
-    conversation_id: u64,
-}
+/// Max users auto-briefed per reply flow (each briefing costs one extra round).
+const MAX_BRIEFED_SUBJECTS: usize = 2;
 
 struct AppState {
     things: ThingsClient,
@@ -493,16 +494,35 @@ async fn test_post(
     println!("=== Prompt ===");
     println!("{user_text}");
 
+    let flow_subjects: Arc<Mutex<Vec<FlowSubject>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool_ctx = {
+        let s = state.read().await;
+        ToolContext::new(
+            Arc::new(s.things.clone()),
+            s.qdrant.clone(),
+            s.runtime.clone(),
+            s.extraction_writer.clone(),
+            flow_subjects,
+        )
+    };
     println!(
         "=== Generating response (key pool: {} keys) ===",
         gemini.pool_size()
     );
-    let response = generate_with_failover(&gemini, &system_prompt, &user_text, &media_files).await?;
+    let (response, sources) = generate_with_tools_failover(
+        &gemini,
+        &system_prompt,
+        &user_text,
+        &media_files,
+        &tool_ctx,
+    )
+    .await?;
 
     println!("=== Raw response ===");
     println!("{response}");
 
-    let (reply_text, entities) = build_reply_with_entities(&response, MAX_RESPONSE_LENGTH);
+    let reply_text = append_sources_footer(&response, &sources);
+    let (reply_text, entities) = build_reply_with_entities(&reply_text, MAX_RESPONSE_LENGTH);
     println!("=== Clean reply text ===");
     println!("{reply_text}");
     println!("=== Entities ===");
@@ -519,7 +539,10 @@ async fn test_post(
     if do_post {
         println!("=== Posting reply ===");
         let things = &state.read().await.things;
-        match things.reply_to_post(post_id, &reply_text, &entities).await {
+        match things
+            .reply_to_post(post_id, &reply_text, &entities, None, None)
+            .await
+        {
             Ok(reply_id) => println!("Posted reply {reply_id} to post {post_id}"),
             Err(e) => println!("Failed to post reply: {e}"),
         }
@@ -878,31 +901,28 @@ async fn is_follow_up_notification(state: &AppState, notification: &Notification
 }
 
 fn notification_post_id(notification: &Notification) -> Option<u64> {
+    notification_post(notification).and_then(|p| p.id_value())
+}
+
+/// The full post row carried by the notification that corresponds to the post
+/// the bot is answering (mirrors `notification_post_id`). Unlike the flat
+/// `GET /post/{id}` response, notification payloads include `post_type` and
+/// `expires_at`, so the reply can mirror the mentioned post's kind and
+/// lifetime.
+fn notification_post(notification: &Notification) -> Option<&Post> {
     if is_mention_notification(notification) {
-        return notification.post_data.as_ref().and_then(|p| p.id_value());
+        return notification.post_data.as_ref();
     }
     if notification.notification_type.as_deref() == Some("post_reply") {
         return notification
             .reply_post_data
             .as_ref()
-            .and_then(|p| p.id_value())
-            .or_else(|| {
-                notification
-                    .original_post_data
-                    .as_ref()
-                    .and_then(|p| p.id_value())
-            });
+            .or(notification.original_post_data.as_ref());
     }
     notification
         .post_data
         .as_ref()
-        .and_then(|p| p.id_value())
-        .or_else(|| {
-            notification
-                .reply_post_data
-                .as_ref()
-                .and_then(|p| p.id_value())
-        })
+        .or(notification.reply_post_data.as_ref())
 }
 
 /// Mark a notification as deliberately skipped (local cache + Qdrant marker),
@@ -966,9 +986,11 @@ async fn process_notification(
     };
 
     let question = extract_question(&post);
-    if question.chars().count() < 2 {
-        info!("Notification {notification_id}: question too short, skipping");
-        return skip_notification(&state, notification_id).await;
+    // An empty mention (no question text) is not skipped: it gets a short
+    // generated greeting instead. Only fully blank content falls through.
+    let is_empty_mention = question.chars().count() < 2;
+    if is_empty_mention {
+        info!("Notification {notification_id}: empty mention, replying with a greeting");
     }
 
     let (conversation_id, ancestors) =
@@ -992,7 +1014,8 @@ async fn process_notification(
 
     {
         let qdrant = state.read().await.qdrant.clone();
-        if qdrant.is_available() {
+        // Empty mentions carry no content worth remembering; skip the store.
+        if qdrant.is_available() && !is_empty_mention {
             if is_follow_up {
                 // Follow-ups must be immediately visible to the context builder.
                 if let Err(e) = qdrant.upsert(&memory_payload).await {
@@ -1008,7 +1031,10 @@ async fn process_notification(
         }
     }
 
-    let user_text = if is_follow_up {
+    let user_text = if is_empty_mention {
+        build_greeting_prompt(&state, &post, &post_data, &ancestors, is_follow_up, conversation_id)
+            .await
+    } else if is_follow_up {
         build_follow_up_prompt(&state, &post, &question, &post_data, conversation_id).await
     } else {
         build_mention_prompt(&state, &post, &question, &ancestors).await
@@ -1022,6 +1048,17 @@ async fn process_notification(
     let media_urls = extract_media_urls(&post);
     let gemini = state.read().await.gemini.clone();
     let system_prompt = state.read().await.system_prompt.clone();
+    let flow_subjects: Arc<Mutex<Vec<FlowSubject>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool_ctx = {
+        let s = state.read().await;
+        ToolContext::new(
+            Arc::new(s.things.clone()),
+            s.qdrant.clone(),
+            s.runtime.clone(),
+            s.extraction_writer.clone(),
+            flow_subjects,
+        )
+    };
 
     // Download media first (per-file tolerant). The reply flow then runs with
     // a sticky API-key lease: on a 429 the key is cooled down, the next key is
@@ -1037,10 +1074,13 @@ async fn process_notification(
         }
     }
 
-    let response = generate_with_failover(&gemini, &system_prompt, &user_text, &media_files).await;
+    let response =
+        generate_with_tools_failover(&gemini, &system_prompt, &user_text, &media_files, &tool_ctx)
+            .await;
 
     let (reply_text, reply_entities) = match response {
-        Ok(text) => {
+        Ok((text, sources)) => {
+            let text = append_sources_footer(&text, &sources);
             let (reply_text, entities) = build_reply_with_entities(&text, MAX_RESPONSE_LENGTH);
             info!(
                 "Generated response ({} chars) for notification {notification_id} with {} entities",
@@ -1057,8 +1097,23 @@ async fn process_notification(
 
     let reply_result = {
         let things = &state.read().await.things;
+        // Mirror the kind and lifetime of the post being answered: the
+        // notification's full post row (not the flat /post/{id} response)
+        // carries post_type and expires_at. Falls back to bot defaults.
+        let mirrored = notification_post(&notification);
+        let reply_type = mirrored.and_then(|p| p.post_type.as_deref());
+        let reply_duration = crate::things_client::post_duration_string(
+            mirrored.and_then(|p| p.created_at.as_deref()),
+            mirrored.and_then(|p| p.expires_at.as_deref()),
+        );
         things
-            .reply_to_post(post_id, &reply_text, &reply_entities)
+            .reply_to_post(
+                post_id,
+                &reply_text,
+                &reply_entities,
+                reply_type,
+                reply_duration.as_deref(),
+            )
             .await
     };
 
@@ -1111,17 +1166,21 @@ async fn process_notification(
     state.write().await.processed.insert(notification_id);
 
     // Long-term memory pass: pull durable user/app facts out of the user's
-    // message in the background. Idempotent, so retries are harmless.
-    let _ = state
-        .read()
-        .await
-        .extraction_writer
-        .send(ExtractionJob {
-            username: post.author_username().to_string(),
-            text: question.clone(),
-            post_id,
-            conversation_id,
-        });
+    // message in the background. Idempotent, so retries are harmless. Empty
+    // mentions have no content to extract from.
+    if !is_empty_mention {
+        let _ = state
+            .read()
+            .await
+            .extraction_writer
+            .send(ExtractionJob {
+                username: post.author_username().to_string(),
+                text: question.clone(),
+                post_id,
+                conversation_id,
+                source: ExtractionSource::Conversation,
+            });
+    }
 
     ProcessOutcome::Replied
 }
@@ -1254,6 +1313,59 @@ async fn build_mention_prompt(
     )
 }
 
+/// Dedicated prompt for empty mentions: the user poked the bot with no
+/// question text, so instead of skipping we generate a short greeting.
+/// Greetings are written in ARABIC and acknowledge the surrounding context
+/// (the thread above a fresh mention, or the ongoing conversation on
+/// follow-ups) so they never feel generic or out of place.
+async fn build_greeting_prompt(
+    state: &RwLock<AppState>,
+    post: &Post,
+    post_data: &models::PostData,
+    ancestors: &[(String, String)],
+    is_follow_up: bool,
+    conversation_id: u64,
+) -> String {
+    let author = post.author_username();
+    let depth_limit = {
+        let runtime = state.read().await.runtime.clone();
+        let cfg = runtime.read().await;
+        cfg.context_depth_limit
+    };
+
+    let context = if is_follow_up {
+        let (ctx, _, _) = load_conversation_context(
+            state,
+            conversation_id,
+            post.id_value(),
+            post_data,
+            depth_limit,
+        )
+        .await;
+        ctx
+    } else {
+        format_ancestor_chain(ancestors, depth_limit)
+    };
+
+    format!(
+        "The user @{author} mentioned you without any question text{}. \
+         Reply with a short, warm greeting in ARABIC (1-2 sentences, no hashtags). \
+         The greeting must naturally acknowledge what the user was discussing \
+         (the context below), not feel generic{}. \
+         End by briefly saying you are here to help. Keep it under 40 words.",
+        if is_follow_up {
+            " (as a follow-up to an ongoing conversation)"
+        } else {
+            ""
+        },
+        if context.is_empty() {
+            "; if there is no context, keep the greeting warm and simple"
+        } else {
+            ""
+        },
+    ) + &context
+}
+
 /// Render the thread above a mention as prompt context, oldest first (the same
 /// shape as `[Conversation so far]` on the follow-up path). Keeps the newest
 /// `limit` entries when the chain is longer.
@@ -1350,25 +1462,17 @@ fn format_app_knowledge_section(facts: &[AppFactPayload]) -> String {
     section
 }
 
-/// Build the prompt for a follow-up question, pulling the conversation history
-/// from Qdrant (strictly scoped to this conversation) and falling back to the
-/// Things API only when memory is unavailable.
-async fn build_follow_up_prompt(
+/// Conversation context block: Qdrant history for the conversation (excluding
+/// the current post), falling back to the Things thread above the post when
+/// memory is unavailable. Returns (context, entry_count, source).
+async fn load_conversation_context(
     state: &RwLock<AppState>,
-    post: &Post,
-    question: &str,
-    post_data: &models::PostData,
     conversation_id: u64,
-) -> String {
-    let author = post.author_username();
-    let current_id = post.id_value();
+    current_id: Option<u64>,
+    post_data: &models::PostData,
+    depth_limit: usize,
+) -> (String, usize, &'static str) {
     let qdrant = state.read().await.qdrant.clone();
-    let depth_limit = {
-        let runtime = state.read().await.runtime.clone();
-        let cfg = runtime.read().await;
-        cfg.context_depth_limit
-    };
-
     let mut context = String::new();
     let mut source = "things-api";
     let mut entry_count = 0usize;
@@ -1400,6 +1504,36 @@ async fn build_follow_up_prompt(
         entry_count = context.matches('\n').count().saturating_sub(1);
     }
 
+    (context, entry_count, source)
+}
+
+/// Build the prompt for a follow-up question, pulling the conversation history
+/// from Qdrant (strictly scoped to this conversation) and falling back to the
+/// Things API only when memory is unavailable.
+async fn build_follow_up_prompt(
+    state: &RwLock<AppState>,
+    post: &Post,
+    question: &str,
+    post_data: &models::PostData,
+    conversation_id: u64,
+) -> String {
+    let author = post.author_username();
+    let current_id = post.id_value();
+    let depth_limit = {
+        let runtime = state.read().await.runtime.clone();
+        let cfg = runtime.read().await;
+        cfg.context_depth_limit
+    };
+
+    let (context, entry_count, source) = load_conversation_context(
+        state,
+        conversation_id,
+        current_id,
+        post_data,
+        depth_limit,
+    )
+    .await;
+
     info!(
         "Follow-up context for conversation {conversation_id} from {source} ({entry_count} entries / {} chars)",
         context.chars().count(),
@@ -1430,7 +1564,7 @@ fn format_context_entries(entries: &[MemoryEntry]) -> String {
     chain
 }
 
-async fn build_thread_context(things: &ThingsClient, start_post: Option<&Post>) -> String {
+pub(crate) async fn build_thread_context(things: &ThingsClient, start_post: Option<&Post>) -> String {
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
 
@@ -1674,7 +1808,7 @@ fn spawn_extraction_worker(
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             // Snapshot the live config per job (panel edits apply immediately).
-            let config = runtime.read().await.memory.clone();
+            let config = runtime.read().await.clone();
             run_extraction_job(&gemini, &qdrant, &config, job).await;
         }
     });
@@ -1684,10 +1818,10 @@ fn spawn_extraction_worker(
 async fn run_extraction_job(
     gemini: &GeminiClient,
     qdrant: &Arc<QdrantClient>,
-    config: &config::MemoryConfig,
+    config: &RuntimeConfig,
     job: ExtractionJob,
 ) {
-    if !config.fact_extraction_enabled
+    if !config.memory.fact_extraction_enabled
         || !qdrant.is_available()
         || job.username.eq_ignore_ascii_case(BOT_USERNAME)
     {
@@ -1704,6 +1838,10 @@ async fn run_extraction_job(
     let now = unix_now();
 
     // ── User facts: reinforce / supersede / insert ──
+    // Profile scans (posts read during a user lookup) insert at most
+    // `user_scan_fact_cap` NEW facts per scan; reinforcement of already-known
+    // facts does not count against the cap.
+    let mut new_facts = 0usize;
     for fact in extracted.user_facts {
         let text = fact.fact.trim();
         if text.chars().count() < 3 || text.chars().count() > MAX_FACT_LENGTH {
@@ -1740,7 +1878,11 @@ async fn run_extraction_job(
             }
         };
         match qdrant
-            .find_similar_user_fact(&job.username, &vector, config.user_fact_supersede_threshold)
+            .find_similar_user_fact(
+                &job.username,
+                &vector,
+                config.memory.user_fact_supersede_threshold,
+            )
             .await
         {
             Ok(Some((old_id, old))) => {
@@ -1761,6 +1903,14 @@ async fn run_extraction_job(
             Err(e) => warn!("Similarity check failed for user fact: {e}"),
         }
 
+        // Profile scans: stop inserting once the cap is hit (keep reinforcing
+        // already-known facts, but do not keep adding brand-new ones).
+        if job.source == ExtractionSource::ProfileScan
+            && new_facts >= config.tools.user_scan_fact_cap
+        {
+            continue;
+        }
+
         let payload = UserFactPayload {
             username: job.username.clone(),
             fact: text.to_string(),
@@ -1778,9 +1928,19 @@ async fn run_extraction_job(
             superseded_by: None,
         };
         match qdrant.upsert_user_fact(point_id, &payload).await {
-            Ok(()) => info!("Learned fact about {}: {text}", job.username),
+            Ok(()) => {
+                new_facts += 1;
+                info!("Learned fact about {}: {text}", job.username);
+            }
             Err(e) => warn!("Failed to store user fact for {}: {e}", job.username),
         }
+    }
+
+    // ── App facts / forget requests: conversation messages only. Profile
+    // scans are scoped to the scanned user — their posts should not mint
+    // app knowledge or delete anyone's memory. ──
+    if job.source != ExtractionSource::Conversation {
+        return;
     }
 
     // ── App facts: store as pending, never authoritative ──
@@ -1824,7 +1984,12 @@ async fn run_extraction_job(
             }
         };
         match qdrant
-            .search_user_facts_semantic(&job.username, &vector, config.forget_similarity_threshold, 3)
+            .search_user_facts_semantic(
+                &job.username,
+                &vector,
+                config.memory.forget_similarity_threshold,
+                3,
+            )
             .await
         {
             Ok(matches) => {
@@ -1883,6 +2048,38 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     }
 }
 
+/// Append a "Sources:" footer listing the URLs the model fetched via the
+/// url_context tool. Deduped, capped, and skipped when empty. URLs stay plain
+/// text — Things auto-links them in the rendered post.
+fn append_sources_footer(text: &str, sources: &[String]) -> String {
+    const MAX_SOURCES: usize = 5;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut urls: Vec<&str> = Vec::new();
+    for url in sources {
+        let url = url.trim();
+        if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+            continue;
+        }
+        if seen.insert(url) {
+            urls.push(url);
+            if urls.len() >= MAX_SOURCES {
+                break;
+            }
+        }
+    }
+    if urls.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 96 + urls.len() * 64);
+    out.push_str(text);
+    out.push_str("\n\nSources:");
+    for url in urls {
+        out.push('\n');
+        out.push_str(url);
+    }
+    out
+}
+
 /// Media bytes downloaded from Things, staged for the reply flow's upload.
 struct DownloadedMedia {
     data: Vec<u8>,
@@ -1902,6 +2099,14 @@ async fn download_media_file(state: &RwLock<AppState>, url: &str) -> Result<Down
     })
 }
 
+/// How one tool-calling reply flow ended.
+enum ToolsFlowError {
+    /// 429/401/403 — the lease key is marked; re-lease with the next key.
+    RateLimited,
+    /// Non-retryable failure (bad request, rounds exhausted, etc.).
+    Failed(anyhow::Error),
+}
+
 /// Run one reply generation flow with rate-limit failover across the key pool.
 ///
 /// The flow uses a sticky key lease: media uploads and the generation that
@@ -1909,14 +2114,26 @@ async fn download_media_file(state: &RwLock<AppState>, url: &str) -> Result<Down
 /// key is cooled down, the next key is leased, and any media is RE-UPLOADED
 /// into the new project before retrying. On success the round-robin cursor
 /// advances past the flow's key, so the next reply starts on the next key.
-async fn generate_with_failover(
+///
+/// When tools are enabled, the model can call them in a multi-round loop on
+/// the same lease: each functionCall (with its thought signature) is appended
+/// to the history as a model-role part, executed via the ToolContext, and its
+/// result appended as a user-role part — for up to `tools.max_rounds` turns.
+///
+/// Returns the final text plus the URLs the model grounded the answer on
+/// (url_context retrievals), used for the Sources footer.
+async fn generate_with_tools_failover(
     gemini: &GeminiClient,
     system_prompt: &str,
     user_text: &str,
     media_files: &[DownloadedMedia],
-) -> Result<String> {
+    tool_ctx: &ToolContext,
+) -> Result<(String, Vec<String>)> {
     let max_flows = gemini.pool_size().max(1) + 1;
     let mut last_err: Option<anyhow::Error> = None;
+    // Profile-scan extraction jobs already flushed at the end of a flow arm,
+    // deduped by username across key-failover retries of the same reply.
+    let mut flushed: HashSet<String> = HashSet::new();
 
     for _ in 0..max_flows {
         let lease = match gemini.acquire_lease() {
@@ -1953,16 +2170,56 @@ async fn generate_with_failover(
             continue;
         }
 
-        match gemini
-            .generate_content_with(&lease, system_prompt, user_text, &file_uris)
-            .await
+        // Initial contents: the user's message plus uploaded media as file
+        // parts. Tool-round results append to this history.
+        let mut contents: Vec<Content> = vec![Content {
+            role: "user".to_string(),
+            parts: {
+                let mut parts = vec![Part::Text {
+                    text: user_text.to_string(),
+                }];
+                for (uri, mime) in &file_uris {
+                    parts.push(Part::FileData {
+                        file_data: FileData {
+                            mime_type: mime.clone(),
+                            file_uri: uri.clone(),
+                        },
+                    });
+                }
+                parts
+            },
+        }];
+
+        let (tools_enabled, max_rounds, url_context_enabled) = {
+            let tools_enabled = tool_ctx.tools_enabled().await;
+            let max_rounds = tool_ctx.max_tool_rounds().await;
+            let url_context_enabled = tool_ctx.url_context_enabled().await;
+            (tools_enabled, max_rounds, url_context_enabled)
+        };
+
+        match run_tool_rounds(
+            gemini,
+            &lease,
+            system_prompt,
+            &mut contents,
+            tool_ctx,
+            tools_enabled,
+            max_rounds,
+            url_context_enabled,
+        )
+        .await
         {
-            Ok(text) => {
+            Ok((text, sources)) => {
                 gemini.flow_success(&lease);
-                return Ok(text);
+                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                return Ok((text, sources));
             }
-            Err(GeminiError::RateLimited) => continue,
-            Err(GeminiError::Failed(e)) => {
+            Err(ToolsFlowError::RateLimited) => {
+                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                continue;
+            }
+            Err(ToolsFlowError::Failed(e)) => {
+                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
                 last_err = Some(e);
                 break;
             }
@@ -1971,6 +2228,405 @@ async fn generate_with_failover(
 
     Err(last_err
         .unwrap_or_else(|| anyhow::anyhow!("all Gemini API keys are currently rate-limited")))
+}
+
+/// The tool-calling loop on one lease: ask the model for a turn, execute any
+/// function calls it requests, feed the results back, repeat until it produces
+/// final text or the round budget is exhausted. Returns the final text plus
+/// every URL the model fetched via the url_context tool across the rounds.
+async fn run_tool_rounds(
+    gemini: &GeminiClient,
+    lease: &KeyLease,
+    system_prompt: &str,
+    contents: &mut Vec<Content>,
+    tool_ctx: &ToolContext,
+    tools_enabled: bool,
+    max_rounds: usize,
+    url_context_enabled: bool,
+) -> Result<(String, Vec<String>), ToolsFlowError> {
+    let declarations = if tools_enabled {
+        tool_declarations(url_context_enabled)
+    } else {
+        Vec::new()
+    };
+
+    // Per-flow cache of executed calls: if the model repeats an identical call
+    // (same name + args) in a later round, we answer with a one-line marker
+    // instead of re-executing and re-echoing a large result into the history.
+    // get_current_time is never cached (it must stay fresh).
+    let mut call_cache: HashMap<String, Value> = HashMap::new();
+    let mut sources: Vec<String> = Vec::new();
+
+    for _ in 0..max_rounds {
+        let turn = match gemini
+            .generate_turn_with(lease, system_prompt, contents, &declarations)
+            .await
+        {
+            Ok(t) => t,
+            Err(GeminiError::RateLimited) => return Err(ToolsFlowError::RateLimited),
+            Err(GeminiError::Failed(e)) => return Err(ToolsFlowError::Failed(e)),
+        };
+        sources.extend(turn.retrieved_urls.clone());
+
+        if turn.function_calls.is_empty() {
+            // The model is ready to answer, but if it looked up a user this
+            // flow we first make sure its reply can draw on that user's saved
+            // facts and a summary of their posts (fresh facts included).
+            if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
+                contents.push(briefing);
+                continue;
+            }
+            match turn.text {
+                Some(t) => return Ok((t, sources)),
+                None => {
+                    // A turn of only server-side tool parts (toolCall/
+                    // toolResponse) with no final answer yet: circulate the
+                    // parts and give the model another round.
+                    append_tool_turn(turn, contents, tool_ctx, &mut call_cache).await;
+                    continue;
+                }
+            }
+        }
+
+        append_tool_turn(turn, contents, tool_ctx, &mut call_cache).await;
+    }
+
+    // The round budget is spent but the model still wanted tools. Execute
+    // nothing more: give it ONE final chance to answer with everything it has
+    // collected — tools withheld so it cannot keep looping. This guarantees a
+    // reply instead of dropping the notification after exhausting rounds.
+    if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
+        contents.push(briefing);
+    }
+    let final_turn = match gemini
+        .generate_turn_with(lease, system_prompt, contents, &[])
+        .await
+    {
+        Ok(t) => t,
+        Err(GeminiError::RateLimited) => return Err(ToolsFlowError::RateLimited),
+        Err(GeminiError::Failed(e)) => return Err(ToolsFlowError::Failed(e)),
+    };
+    if final_turn.function_calls.is_empty() {
+        if let Some(text) = final_turn.text {
+            return Ok((text, sources));
+        }
+    }
+    Err(ToolsFlowError::Failed(anyhow::anyhow!(
+        "model exhausted {max_rounds} tool rounds without a final answer"
+    )))
+}
+
+/// Auto-brief the model on the most recent user it looked up during this
+/// reply flow: saved facts + recent posts, plus a fresh inline fact
+/// extraction when posts were fetched, so the final reply includes facts
+/// gathered BEFORE it is written. Returns the user-role part to append, or
+/// None when there is nothing (no un-briefed subject, or nothing known).
+async fn build_user_briefing(gemini: &GeminiClient, tool_ctx: &ToolContext) -> Option<Content> {
+    let (username, user_id, posts) = {
+        let mut subjects = tool_ctx.flow_subjects.lock().unwrap();
+        if subjects.iter().filter(|s| s.briefed).count() >= MAX_BRIEFED_SUBJECTS {
+            return None;
+        }
+        let subject = subjects
+            .iter_mut()
+            .rev()
+            .find(|s| !s.briefed && s.username.is_some())?;
+        let username = subject.username.clone()?;
+        if username.eq_ignore_ascii_case(BOT_USERNAME) {
+            return None;
+        }
+        let user_id = subject.user_id;
+        let posts = subject.posts.clone();
+        subject.briefed = true;
+        (username, user_id, posts)
+    };
+
+    let config = tool_ctx.runtime.read().await.clone();
+
+    // Posts: reuse the in-flow get_user_posts result, else fetch (bounded).
+    let mut posts_value = posts;
+    if posts_value.is_none() {
+        if let Some(id) = user_id {
+            if let Ok(page) = tool_ctx
+                .things
+                .get_user_posts(id, config.tools.user_scan_posts_limit)
+                .await
+            {
+                posts_value = Some(json!(
+                    page.data.unwrap_or_default()
+                        .iter()
+                        .map(|p| {
+                            json!({
+                                "id": p.id,
+                                "created_at": p.created_at,
+                                "post_type": p.post_type,
+                                "content": p.content_text(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+    }
+    let post_list: Vec<String> = posts_value
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("content").and_then(|c| c.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Fresh facts: run the profile-scan extraction inline (at most once per
+    // reply flow) so facts learned from the posts already exist in memory
+    // before the final reply is written.
+    let mut should_extract = config.memory.fact_extraction_enabled
+        && tool_ctx.qdrant.is_available()
+        && !post_list.is_empty();
+    if should_extract {
+        let mut subjects = tool_ctx.flow_subjects.lock().unwrap();
+        if subjects.iter().any(|s| s.extracted) {
+            should_extract = false;
+        } else if let Some(s) = subjects.iter_mut().find(|s| {
+            s.username
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&username))
+        }) {
+            s.extracted = true;
+        } else {
+            should_extract = false;
+        }
+    }
+    if should_extract {
+        let contents: Vec<&str> = post_list.iter().map(|s| s.as_str()).collect();
+        let text = crate::tools::profile_scan_text(&username, &contents);
+        if !text.is_empty() {
+            let post_id = posts_value
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let job = ExtractionJob {
+                username: username.clone(),
+                text,
+                post_id,
+                conversation_id: 0,
+                source: ExtractionSource::ProfileScan,
+            };
+            run_extraction_job(gemini, &tool_ctx.qdrant, &config, job).await;
+        }
+    }
+
+    // Saved facts (re-read after the inline extraction, so fresh facts show).
+    let facts: Vec<String> = if tool_ctx.qdrant.is_available() {
+        match tool_ctx
+            .qdrant
+            .list_user_facts(&username, config.memory.user_facts_limit.max(20))
+            .await
+        {
+            Ok(list) => list.into_iter().map(|(_, f)| f.fact).collect(),
+            Err(e) => {
+                warn!("build_user_briefing: list_user_facts({username}) failed: {e}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if facts.is_empty() && post_list.is_empty() {
+        return None;
+    }
+    let text = user_briefing_text(&username, &facts, &post_list);
+    info!(
+        "Injected user briefing for @{username} ({} facts, {} posts)",
+        facts.len(),
+        post_list.len()
+    );
+    Some(Content {
+        role: "user".to_string(),
+        parts: vec![Part::Text { text }],
+    })
+}
+
+/// The briefing context part text: saved facts + numbered recent posts + the
+/// instruction to base the reply on them (facts and a short post summary).
+fn user_briefing_text(username: &str, facts: &[String], posts: &[String]) -> String {
+    let mut out = format!("[Briefing for @{username}]\n");
+    if !facts.is_empty() {
+        out.push_str("Saved facts about them:\n");
+        for f in facts {
+            out.push_str(&format!("- {f}\n"));
+        }
+    }
+    if !posts.is_empty() {
+        out.push_str("Their recent posts:\n");
+        for (i, p) in posts.iter().enumerate() {
+            out.push_str(&format!("{}. {p}\n", i + 1));
+        }
+    }
+    out.push_str("\nBase your reply on the facts above and include a short summary of their recent posts.");
+    out
+}
+
+/// End-of-flow safety net: queue the profile-scan extraction for any subject
+/// whose posts were fetched during the flow but whose facts were not already
+/// extracted inline by the briefing step (e.g. the flow failed or no briefing
+/// ran). `flushed` dedupes across key-failover retries of the same flow.
+async fn flush_pending_profile_scans(tool_ctx: &ToolContext, flushed: &mut HashSet<String>) {
+    let subjects = tool_ctx.flow_subjects.lock().unwrap().clone();
+    for subject in subjects {
+        let Some(username) = subject.username else { continue };
+        let Some(posts) = subject.posts else { continue };
+        if subject.extracted || username.eq_ignore_ascii_case(BOT_USERNAME) {
+            continue;
+        }
+        if !flushed.insert(username.to_ascii_lowercase()) {
+            continue;
+        }
+        let contents: Vec<&str> = posts
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.get("content").and_then(|c| c.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = crate::tools::profile_scan_text(&username, &contents);
+        if text.is_empty() {
+            continue;
+        }
+        let post_id = posts
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let job = ExtractionJob {
+            username: username.clone(),
+            text,
+            post_id,
+            conversation_id: 0,
+            source: ExtractionSource::ProfileScan,
+        };
+        if tool_ctx.extraction_tx.send(job).is_err() {
+            warn!("Extraction worker gone; profile-scan facts for {username} not queued");
+        } else {
+            info!("Queued profile-scan fact extraction for {username}");
+        }
+    }
+}
+
+/// Append the model's functionCall parts to the history, execute every call
+/// via the ToolContext, and append the results as user-role parts.
+///
+/// Cost guards (quality-neutral — the model gets the same data either way):
+/// - identical calls within one turn are executed ONCE; repeats get a short
+///   "cached" marker instead of a duplicated full result,
+/// - a call repeated in a later round (same name + args) is answered from
+///   `call_cache` with the same marker instead of re-executing and re-echoing
+///   a large result into the history.
+async fn append_tool_turn(
+    turn: GenerateTurn,
+    contents: &mut Vec<Content>,
+    tool_ctx: &ToolContext,
+    call_cache: &mut HashMap<String, Value>,
+) {
+    // Append the model's parts verbatim (thought signatures and ids intact).
+    // With tool context circulation this must include the server-side
+    // toolCall/toolResponse parts, not just the functionCall parts — and even
+    // interim text parts, which the API counts into the conversation.
+    contents.push(Content {
+        role: "model".to_string(),
+        parts: turn.raw_parts.clone(),
+    });
+
+    // Map each executed call (name + args) to its API-assigned id, so the
+    // functionResponse echoes it back (required for tool context circulation).
+    let mut id_by_key: HashMap<String, String> = HashMap::new();
+    for part in &turn.raw_parts {
+        if let Part::FunctionCall {
+            function_call,
+            ..
+        } = part
+        {
+            if let Some(id) = &function_call.id {
+                id_by_key.insert(call_cache_key(&function_call.name, &function_call.args), id.clone());
+            }
+        }
+    }
+
+    // Plan: which calls actually need fresh execution?
+    let mut first_seen: HashMap<String, usize> = HashMap::new();
+    let mut scheduled: Vec<(String, String, Value)> = Vec::new(); // (key, name, args)
+    for (i, call) in turn.function_calls.iter().enumerate() {
+        let key = call_cache_key(&call.name, &call.args);
+        if first_seen.contains_key(&key) {
+            continue; // duplicate within this turn
+        }
+        first_seen.insert(key.clone(), i);
+        let cacheable = call.name != "get_current_time";
+        if cacheable && call_cache.contains_key(&key) {
+            continue; // already executed in an earlier round
+        }
+        scheduled.push((key, call.name.clone(), call.args.clone()));
+    }
+
+    // Execute the unique fresh calls and record their results.
+    let mut turn_results: HashMap<String, Value> = HashMap::new();
+    for (key, name, args) in scheduled {
+        let result = tool_ctx.execute(&name, &args).await;
+        if name != "get_current_time" {
+            call_cache.insert(key.clone(), result.clone());
+        }
+        turn_results.insert(key, result);
+    }
+
+    // Emit one response part per call, in the original order.
+    let mut response_parts: Vec<Part> = Vec::new();
+    for (i, call) in turn.function_calls.iter().enumerate() {
+        let key = call_cache_key(&call.name, &call.args);
+        let response = if first_seen.get(&key) == Some(&i) {
+            match turn_results.get(&key).or_else(|| call_cache.get(&key)) {
+                Some(r) => r.clone(),
+                None => json!({ "error": "internal: missing tool result" }),
+            }
+        } else {
+            json!({
+                "cached": true,
+                "note": format!(
+                    "This exact call to {}() with the same arguments was already executed \
+                     earlier in this conversation; the result shown above is unchanged.",
+                    call.name
+                ),
+            })
+        };
+        info!(
+            "Tool {}({}) -> {}",
+            call.name,
+            truncate_text(&call.args.to_string(), 200),
+            truncate_text(&response.to_string(), 300)
+        );
+        response_parts.push(Part::FunctionResponse {
+            function_response: FunctionResponseData {
+                name: call.name.clone(),
+                response,
+                id: id_by_key.get(&key).cloned(),
+            },
+        });
+    }
+    contents.push(Content {
+        role: "user".to_string(),
+        parts: response_parts,
+    });
+}
+
+/// Stable key identifying one tool invocation (name + exact arguments).
+fn call_cache_key(name: &str, args: &Value) -> String {
+    serde_json::to_string(&(name, args)).unwrap_or_else(|_| format!("{name}:{args}"))
 }
 
 #[cfg(test)]
@@ -1999,6 +2655,73 @@ mod tests {
     fn strip_mention_does_not_mangle_longer_handles() {
         assert_eq!(strip_mention("hi @AskMeBot"), "hi @AskMeBot");
         assert_eq!(strip_mention("email askme@example.com"), "email askme@example.com");
+    }
+
+    #[test]
+    fn sources_footer_appends_deduped_capped_urls() {
+        assert_eq!(append_sources_footer("answer", &[]), "answer");
+        assert_eq!(
+            append_sources_footer("answer", &["https://a.example".to_string()]),
+            "answer\n\nSources:\nhttps://a.example"
+        );
+        let dupes = vec![
+            "https://a.example".to_string(),
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ];
+        let out = append_sources_footer("answer", &dupes);
+        assert!(out.matches("https://a.example").count() == 1);
+        assert!(out.contains("https://b.example"));
+
+        let many: Vec<String> = (0..9).map(|i| format!("https://s{i}.example")).collect();
+        assert_eq!(append_sources_footer("a", &many).lines().count(), 8, "1 text + 1 blank + 1 header + 5 urls");
+        assert!(!append_sources_footer("a", &many).contains("https://s5.example"));
+    }
+
+    #[test]
+    fn sources_footer_skips_invalid_urls() {
+        assert_eq!(
+            append_sources_footer("a", &["not-a-url".to_string(), "".to_string(), "ftp://x".to_string()]),
+            "a"
+        );
+    }
+
+    #[test]
+    fn user_briefing_text_lists_facts_posts_and_instruction() {
+        let facts = vec!["thinks the app is beautiful and clear.".to_string()];
+        let posts = vec!["بسم الله الرحمن الرحيم".to_string(), "تعالوا في عيديات".to_string()];
+        let text = user_briefing_text("Fahad", &facts, &posts);
+        assert!(text.contains("[Briefing for @Fahad]"));
+        assert!(text.contains("Saved facts about them:"));
+        assert!(text.contains("- thinks the app is beautiful and clear."));
+        assert!(text.contains("Their recent posts:"));
+        assert!(text.contains("1. بسم الله الرحمن الرحيم"));
+        assert!(text.contains("2. تعالوا في عيديات"));
+        assert!(text.contains("include a short summary of their recent posts"));
+    }
+
+    #[test]
+    fn user_briefing_text_facts_only_when_no_posts() {
+        let facts = vec!["lives in Riyadh".to_string()];
+        let text = user_briefing_text("X", &facts, &[]);
+        assert!(text.contains("Saved facts about them:"));
+        assert!(!text.contains("Their recent posts:"));
+        assert!(text.contains("include a short summary"));
+    }
+
+    #[test]
+    fn call_cache_key_orders_and_unescapes() {
+        let a = call_cache_key("get_user_profile", &json!({"user_id": 309}));
+        let b = call_cache_key("get_user_profile", &json!({"user_id": 262}));
+        assert_ne!(a, b);
+        let c = call_cache_key("get_user_posts", &json!({"user_id": 309, "limit": 10}));
+        assert_ne!(a, c);
+        let d = call_cache_key("get_user_posts", &json!({"limit": 10, "user_id": 309}));
+        assert_eq!(c, d);
+        assert_eq!(
+            call_cache_key("get_current_time", &json!({})),
+            call_cache_key("get_current_time", &json!({}))
+        );
     }
 
     #[test]
@@ -2088,6 +2811,7 @@ mod tests {
             audio: None,
             post_type: None,
             created_at: None,
+            expires_at: None,
             content: None,
             comments: None,
             images: None,
@@ -2248,6 +2972,15 @@ mod tests {
                 fact_extraction_enabled: true,
             },
             context_depth_limit: 20,
+            tools: config::ToolsConfig {
+                enabled: true,
+                max_rounds: 6,
+                web_fetch_max_bytes: 512_000,
+                web_fetch_timeout_secs: 15,
+                user_scan_posts_limit: 10,
+                user_scan_fact_cap: 3,
+                url_context_enabled: true,
+            },
         }));
         let extraction_writer =
             spawn_extraction_worker(gemini.clone(), qdrant.clone(), runtime.clone());

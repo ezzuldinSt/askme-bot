@@ -300,6 +300,30 @@
         </div>
       </div>
 
+      <div class="section-title">Tools <span class="chip ok">applies instantly</span></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="row"><span class="k">Tool calling</span>
+            <span class="toggle"><input id="cfg-tools_enabled" type="checkbox"><span class="track"></span><span class="thumb"></span></span></div>
+          <div class="hint" style="margin-top:6px;">Gemini may call web_fetch / user lookup / memory tools before answering.</div>
+          <div class="row"><span class="k">Auto-fetch URLs in messages</span>
+            <span class="toggle"><input id="cfg-url_context_enabled" type="checkbox"><span class="track"></span><span class="thumb"></span></span></div>
+          <div class="hint" style="margin-top:6px;">Gemini's URL context tool fetches http(s) links in the question automatically; web_fetch stays as fallback.</div>
+          <div class="field"><label>Max tool rounds <span class="hint">API calls per reply (1-8)</span></label>
+            <input id="cfg-max_tool_rounds" type="number" min="1" max="8"></div>
+          <div class="field"><label>Profile scan posts <span class="hint">posts read per user lookup (1-30)</span></label>
+            <input id="cfg-user_scan_posts_limit" type="number" min="1" max="30"></div>
+        </div>
+        <div class="card">
+          <div class="field"><label>web_fetch max bytes <span class="hint">per URL (16KB-2MB)</span></label>
+            <input id="cfg-web_fetch_max_bytes" type="number" min="16384" max="2000000"></div>
+          <div class="field"><label>web_fetch timeout <span class="hint">seconds (3-60)</span></label>
+            <input id="cfg-web_fetch_timeout_secs" type="number" min="3" max="60"></div>
+          <div class="field"><label>Scan fact cap <span class="hint">new facts auto-saved per profile scan</span></label>
+            <input id="cfg-user_scan_fact_cap" type="number" min="0" max="50"></div>
+        </div>
+      </div>
+
       <div class="section-title">Gemini API keys <span class="chip ok">applies instantly</span></div>
       <div class="card">
         <div class="field"><label>Key pool — one key per line <span class="hint">replies rotate round-robin; rate-limited keys cool down automatically</span></label>
@@ -555,13 +579,16 @@ async function loadStatus() {
 
 /* ── configuration ── */
 const HOT_FIELDS = ['user_facts_limit', 'app_knowledge_limit', 'app_knowledge_min_score',
-  'user_fact_supersede_threshold', 'forget_similarity_threshold', 'context_depth_limit', 'generation_model'];
+  'user_fact_supersede_threshold', 'forget_similarity_threshold', 'context_depth_limit', 'generation_model',
+  'max_tool_rounds', 'web_fetch_max_bytes', 'web_fetch_timeout_secs', 'user_scan_posts_limit', 'user_scan_fact_cap'];
 let restartSnapshot = {};
 async function loadConfig() {
   try {
     const d = await apiJson('/api/config');
     for (const f of HOT_FIELDS) $(`cfg-${f}`).value = d.hot[f];
     $('cfg-fact_extraction_enabled').checked = d.hot.fact_extraction_enabled;
+    $('cfg-tools_enabled').checked = d.hot.tools.enabled;
+    $('cfg-url_context_enabled').checked = d.hot.tools.url_context_enabled;
     $('cfg-thinking_level').value = d.hot.thinking_level ?? 'default';
     $('cfg-gemini_api_keys').value = '';
     $('cfg-gemini_api_keys').placeholder = `${d.restart.gemini_keys_count} key(s) in pool — paste to replace`;
@@ -582,7 +609,7 @@ async function loadConfig() {
 }
 $('config-reload').onclick = loadConfig;
 $('config-save').onclick = async () => {
-  const body = { fact_extraction_enabled: $('cfg-fact_extraction_enabled').checked };
+  const body = { fact_extraction_enabled: $('cfg-fact_extraction_enabled').checked, tools_enabled: $('cfg-tools_enabled').checked, url_context_enabled: $('cfg-url_context_enabled').checked };
   for (const f of HOT_FIELDS) {
     if (f === 'generation_model') { body[f] = $(`cfg-${f}`).value; continue; }
     body[f] = f.includes('threshold') || f.includes('score') ? parseFloat($(`cfg-${f}`).value) : parseInt($(`cfg-${f}`).value, 10);

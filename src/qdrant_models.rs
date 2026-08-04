@@ -168,6 +168,17 @@ impl FactCategory {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FactCategory::Identity => "identity",
+            FactCategory::Location => "location",
+            FactCategory::Occupation => "occupation",
+            FactCategory::Preference => "preference",
+            FactCategory::Opinion => "opinion",
+            FactCategory::Other => "other",
+        }
+    }
 }
 
 /// Payload stored on every point in the user-profiles collection.

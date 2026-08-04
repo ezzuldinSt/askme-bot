@@ -588,6 +588,38 @@ impl QdrantClient {
             .await
     }
 
+    /// Semantic search across EVERY user's ACTIVE facts (no username scope).
+    /// Used by the bot's user-lookup tool, where the queried user may only be
+    /// known by a name or a username fragment. Results carry their owner.
+    pub async fn search_user_facts_global(
+        &self,
+        vector: &[f32],
+        threshold: f32,
+        limit: u64,
+    ) -> Result<Vec<(String, UserFactPayload)>> {
+        let client = self.client()?;
+        let filter = Filter::all([Condition::matches("active", true)]);
+        let builder = QueryPointsBuilder::new(USER_PROFILES_COLLECTION_NAME.to_string())
+            .query(vector.to_vec())
+            .filter(filter)
+            .limit(limit.max(1))
+            .score_threshold(threshold)
+            .with_payload(true)
+            .with_vectors(false);
+        let response = client
+            .query(builder)
+            .await
+            .context("Failed to query user facts from Qdrant")?;
+        Ok(response
+            .result
+            .into_iter()
+            .filter_map(|p| {
+                let payload: UserFactPayload = decode_payload(&p.payload)?;
+                Some((payload.username.clone(), payload))
+            })
+            .collect())
+    }
+
     async fn query_user_facts(
         &self,
         username: &str,

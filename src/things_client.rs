@@ -14,6 +14,40 @@ pub const TOKEN_FILE: &str = ".token.json";
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
+/// Post type used for bot replies. "b" is the code the Things app's own post
+/// composer sends; the bot previously used "r" (reply). Keeping the app's code
+/// makes replies behave like normal app posts. Used when the mentioned post
+/// carries no post_type of its own.
+const REPLY_POST_TYPE: &str = "b";
+/// How long bot replies stay live before expiring (Things posts are
+/// ephemeral). "1w" = one week. Used when the mentioned post carries no
+/// expiry to mirror.
+const REPLY_POST_DURATION: &str = "1w";
+
+/// Derive the API's `post_duration` string from a post's created/expiry
+/// timestamps, so a reply can mirror the lifetime of the post it answers.
+/// Only emits units the app is known to accept ("Nh" hours, "Nw" weeks);
+/// anything else (unparseable, not whole hours/weeks) yields None and the
+/// caller falls back to `REPLY_POST_DURATION`.
+pub fn post_duration_string(created_at: Option<&str>, expires_at: Option<&str>) -> Option<String> {
+    let (Some(created_at), Some(expires_at)) = (created_at, expires_at) else {
+        return None;
+    };
+    let created = chrono::DateTime::parse_from_rfc3339(created_at).ok()?;
+    let expires = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    let secs = expires.signed_duration_since(created).num_seconds();
+    if secs <= 0 {
+        return None;
+    }
+    if secs % (7 * 24 * 3600) == 0 {
+        return Some(format!("{}w", secs / (7 * 24 * 3600)));
+    }
+    if secs % 3600 == 0 {
+        return Some(format!("{}h", secs / 3600));
+    }
+    None
+}
+
 /// Raised on HTTP 401: the cached auth token is expired or invalid and the bot
 /// cannot recover on its own (login requires an interactive OTP).
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +102,7 @@ struct CachedToken {
     token: String,
 }
 
+#[derive(Clone)]
 pub struct ThingsClient {
     client: Client,
     api_base: String,
@@ -276,16 +311,134 @@ impl ThingsClient {
         .await
     }
 
+    /// Search users globally (substring match on username/name). The caller
+    /// filters for the exact case-insensitive username.
+    pub async fn search_users(&self, query: &str, per_page: u64) -> Result<Vec<UserSearchRow>> {
+        self.retry(|| async {
+            let url = reqwest::Url::parse_with_params(
+                &format!("{}/users", self.api_base),
+                &[
+                    ("search", query),
+                    ("per_page", &per_page.to_string()),
+                ],
+            )
+            .map_err(|e| {
+                RequestError::Fatal(anyhow::Error::new(e).context("Failed to build users URL"))
+            })?;
+
+            let resp = self
+                .client
+                .get(url)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
+                .send()
+                .await
+                .map_err(transport_error("Failed to search users"))?;
+
+            let status = resp.status();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read users response"))?;
+
+            if !status.is_success() {
+                return Err(http_error(status, "Users search error", &bytes));
+            }
+
+            let envelope: UsersEnvelope = serde_json::from_slice(&bytes).map_err(|e| {
+                RequestError::Fatal(
+                    anyhow::Error::new(e).context("Failed to parse users search response"),
+                )
+            })?;
+
+            Ok(envelope.data.unwrap_or_default())
+        })
+        .await
+    }
+
+    /// Full user profile (bio, joined_at, streak, ...) by numeric id.
+    pub async fn get_user(&self, user_id: u64) -> Result<UserProfile> {
+        self.retry(|| async {
+            let url = format!("{}/user/{user_id}", self.api_base);
+            let resp = self
+                .client
+                .get(&url)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
+                .send()
+                .await
+                .map_err(transport_error("Failed to fetch user profile"))?;
+
+            let status = resp.status();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read user profile response"))?;
+
+            if !status.is_success() {
+                return Err(http_error(status, "Get user error", &bytes));
+            }
+
+            serde_json::from_slice(&bytes).map_err(|e| {
+                RequestError::Fatal(
+                    anyhow::Error::new(e).context("Failed to parse user profile response"),
+                )
+            })
+        })
+        .await
+    }
+
+    /// A user's recent posts (cursor-paginated, newest first).
+    pub async fn get_user_posts(&self, user_id: u64, per_page: u64) -> Result<UserPostsPage> {
+        self.retry(|| async {
+            let url = reqwest::Url::parse_with_params(
+                &format!("{}/user/{user_id}/posts", self.api_base),
+                &[("per_page", per_page.to_string())],
+            )
+            .map_err(|e| {
+                RequestError::Fatal(anyhow::Error::new(e).context("Failed to build user posts URL"))
+            })?;
+
+            let resp = self
+                .client
+                .get(url)
+                .headers(self.auth_headers().map_err(RequestError::Fatal)?)
+                .send()
+                .await
+                .map_err(transport_error("Failed to fetch user posts"))?;
+
+            let status = resp.status();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(transport_error("Failed to read user posts response"))?;
+
+            if !status.is_success() {
+                return Err(http_error(status, "Get user posts error", &bytes));
+            }
+
+            serde_json::from_slice(&bytes).map_err(|e| {
+                RequestError::Fatal(
+                    anyhow::Error::new(e).context("Failed to parse user posts response"),
+                )
+            })
+        })
+        .await
+    }
+
     /// Post a reply. Intentionally NOT retried: if the server commits the reply
     /// but the response is lost (timeout, dropped connection), retrying would
     /// post a duplicate — the bot's cardinal sin. A single attempt is safer.
+    ///
+    /// `post_type`/`post_duration` mirror the post being answered (None falls
+    /// back to the bot's own defaults).
     pub async fn reply_to_post(
         &self,
         parent_post_id: u64,
         content: &str,
         entities: &[PostEntity],
+        post_type: Option<&str>,
+        post_duration: Option<&str>,
     ) -> Result<u64> {
-        let form = self.build_reply_form(parent_post_id, content, entities);
+        let form = self.build_reply_form(parent_post_id, content, entities, post_type, post_duration);
 
         let url = format!("{}/posts", self.api_base);
         let resp = self
@@ -396,6 +549,8 @@ impl ThingsClient {
         parent_post_id: u64,
         content: &str,
         entities: &[PostEntity],
+        post_type: Option<&str>,
+        post_duration: Option<&str>,
     ) -> Form {
         let mut form = Form::new()
             .text("location_name", "")
@@ -405,8 +560,14 @@ impl ThingsClient {
             .text("city", "")
             .text("comments", content.to_string())
             .text("post_id", parent_post_id.to_string())
-            .text("post_type", "r".to_string())
-            .text("post_duration", "3h".to_string())
+            .text(
+                "post_type",
+                post_type.unwrap_or(REPLY_POST_TYPE).to_string(),
+            )
+            .text(
+                "post_duration",
+                post_duration.unwrap_or(REPLY_POST_DURATION).to_string(),
+            )
             .text("allow_screenshot", "1".to_string())
             .text("is_private", "0".to_string());
 
@@ -445,5 +606,65 @@ impl ThingsClient {
         }
         Err(last_error
             .unwrap_or_else(|| anyhow::anyhow!("Request failed after {MAX_RETRIES} retries")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_string_mirrors_known_units() {
+        let one_week = (
+            Some("2026-08-02T21:06:26.000000Z"),
+            Some("2026-08-09T21:06:26.000000Z"),
+        );
+        assert_eq!(post_duration_string(one_week.0, one_week.1).as_deref(), Some("1w"));
+
+        let three_hours = (
+            Some("2026-08-03T18:00:00Z"),
+            Some("2026-08-03T21:00:00Z"),
+        );
+        assert_eq!(
+            post_duration_string(three_hours.0, three_hours.1).as_deref(),
+            Some("3h")
+        );
+
+        let two_weeks = (
+            Some("2026-08-01T00:00:00Z"),
+            Some("2026-08-15T00:00:00Z"),
+        );
+        assert_eq!(
+            post_duration_string(two_weeks.0, two_weeks.1).as_deref(),
+            Some("2w")
+        );
+    }
+
+    #[test]
+    fn duration_string_rejects_unmappable_or_missing() {
+        // Odd interval (90 minutes) is not a known unit -> fallback needed.
+        assert_eq!(
+            post_duration_string(
+                Some("2026-08-03T18:00:00Z"),
+                Some("2026-08-03T19:30:00Z")
+            ),
+            None
+        );
+        // Expiry before creation is nonsense.
+        assert_eq!(
+            post_duration_string(
+                Some("2026-08-03T21:00:00Z"),
+                Some("2026-08-03T18:00:00Z")
+            ),
+            None
+        );
+        // Missing timestamps -> None.
+        assert_eq!(post_duration_string(None, None), None);
+        assert_eq!(post_duration_string(Some("2026-08-03T18:00:00Z"), None), None);
+        // Garbage dates -> None.
+        assert_eq!(
+            post_duration_string(Some("not-a-date"), Some("also-not-a-date")),
+            None
+        );
     }
 }

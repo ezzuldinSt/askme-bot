@@ -437,6 +437,15 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "context_depth_limit": resolved.context_depth_limit,
             "generation_model": config::resolve_generation_model(o),
             "thinking_level": config::resolve_thinking_level(o),
+            "tools": {
+                "enabled": resolved.tools.enabled,
+                "max_rounds": resolved.tools.max_rounds,
+                "web_fetch_max_bytes": resolved.tools.web_fetch_max_bytes,
+                "web_fetch_timeout_secs": resolved.tools.web_fetch_timeout_secs,
+                "user_scan_posts_limit": resolved.tools.user_scan_posts_limit,
+                "user_scan_fact_cap": resolved.tools.user_scan_fact_cap,
+                "url_context_enabled": resolved.tools.url_context_enabled,
+            },
         },
         "overridden": {
             "user_facts_limit": o.user_facts_limit.is_some(),
@@ -477,6 +486,14 @@ struct ConfigUpdate {
     forget_similarity_threshold: f32,
     fact_extraction_enabled: bool,
     context_depth_limit: usize,
+    // Tool calling (hot-applied, always concrete values from the form).
+    tools_enabled: bool,
+    max_tool_rounds: usize,
+    web_fetch_max_bytes: usize,
+    web_fetch_timeout_secs: u64,
+    user_scan_posts_limit: u64,
+    user_scan_fact_cap: usize,
+    url_context_enabled: bool,
     // Hot-applied (empty/None = leave unchanged).
     gemini_api_keys: Option<Vec<String>>,
     generation_model: Option<String>,
@@ -567,6 +584,18 @@ async fn put_config(
     if !(1..=200).contains(&req.context_depth_limit) {
         return err(StatusCode::BAD_REQUEST, "context_depth_limit must be 1-200");
     }
+    if !(1..=8).contains(&req.max_tool_rounds) {
+        return err(StatusCode::BAD_REQUEST, "max_tool_rounds must be 1-8");
+    }
+    if !(16_384..=2_000_000).contains(&req.web_fetch_max_bytes) {
+        return err(StatusCode::BAD_REQUEST, "web_fetch_max_bytes must be 16384-2000000");
+    }
+    if !(3..=60).contains(&req.web_fetch_timeout_secs) {
+        return err(StatusCode::BAD_REQUEST, "web_fetch_timeout_secs must be 3-60");
+    }
+    if !(1..=30).contains(&req.user_scan_posts_limit) {
+        return err(StatusCode::BAD_REQUEST, "user_scan_posts_limit must be 1-30");
+    }
 
     let mut cfg = st.bot_config.write().await;
     let old = cfg.overrides.clone();
@@ -578,6 +607,13 @@ async fn put_config(
     o.forget_similarity_threshold = Some(req.forget_similarity_threshold);
     o.fact_extraction_enabled = Some(req.fact_extraction_enabled);
     o.context_depth_limit = Some(req.context_depth_limit);
+    o.tools_enabled = Some(req.tools_enabled);
+    o.max_tool_rounds = Some(req.max_tool_rounds);
+    o.web_fetch_max_bytes = Some(req.web_fetch_max_bytes);
+    o.web_fetch_timeout_secs = Some(req.web_fetch_timeout_secs);
+    o.user_scan_posts_limit = Some(req.user_scan_posts_limit);
+    o.user_scan_fact_cap = Some(req.user_scan_fact_cap);
+    o.url_context_enabled = Some(req.url_context_enabled);
 
     // Key pool: empty/None = unchanged; otherwise replace wholesale (min 1).
     let new_keys = match req.gemini_api_keys {

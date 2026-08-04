@@ -113,6 +113,22 @@ pub struct ConfigOverrides {
     pub forget_similarity_threshold: Option<f32>,
     pub fact_extraction_enabled: Option<bool>,
     pub context_depth_limit: Option<usize>,
+    // Tool calling (hot-applied).
+    /// Master switch for the Gemini tool loop (web_fetch, user lookup, ...).
+    pub tools_enabled: Option<bool>,
+    /// Max tool-execution rounds per reply (each round is one API call).
+    pub max_tool_rounds: Option<usize>,
+    /// Built-in Gemini URL context tool: the model auto-fetches http(s) URLs
+    /// from the conversation instead of calling web_fetch for them.
+    pub url_context_enabled: Option<bool>,
+    /// Max bytes web_fetch downloads per URL.
+    pub web_fetch_max_bytes: Option<usize>,
+    /// Per-request timeout for web_fetch, in seconds.
+    pub web_fetch_timeout_secs: Option<u64>,
+    /// How many posts a user-profile scan looks at.
+    pub user_scan_posts_limit: Option<u64>,
+    /// Max NEW facts auto-saved from one profile scan.
+    pub user_scan_fact_cap: Option<usize>,
     // Hot-applied.
     /// Gemini API key pool (round-robin). Legacy single `gemini_api_key`
     /// migrates into a pool of one.
@@ -225,6 +241,19 @@ pub struct MemoryConfig {
 pub struct RuntimeConfig {
     pub memory: MemoryConfig,
     pub context_depth_limit: usize,
+    pub tools: ToolsConfig,
+}
+
+/// Tool-calling knobs.
+#[derive(Debug, Clone)]
+pub struct ToolsConfig {
+    pub enabled: bool,
+    pub max_rounds: usize,
+    pub web_fetch_max_bytes: usize,
+    pub web_fetch_timeout_secs: u64,
+    pub user_scan_posts_limit: u64,
+    pub user_scan_fact_cap: usize,
+    pub url_context_enabled: bool,
 }
 
 fn env_u64(key: &str) -> Option<u64> {
@@ -277,6 +306,42 @@ impl RuntimeConfig {
                 .context_depth_limit
                 .or_else(|| env_usize("CONTEXT_DEPTH_LIMIT"))
                 .unwrap_or(20),
+            tools: ToolsConfig {
+                enabled: overrides.tools_enabled.unwrap_or_else(|| {
+                    std::env::var("TOOLS_ENABLED")
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+                        .unwrap_or(true)
+                }),
+                max_rounds: overrides
+                    .max_tool_rounds
+                    .or_else(|| env_usize("MAX_TOOL_ROUNDS"))
+                    .unwrap_or(6)
+                    .clamp(1, 8),
+                web_fetch_max_bytes: overrides
+                    .web_fetch_max_bytes
+                    .or_else(|| env_usize("WEB_FETCH_MAX_BYTES"))
+                    .unwrap_or(512_000)
+                    .clamp(16_384, 2_000_000),
+                web_fetch_timeout_secs: overrides
+                    .web_fetch_timeout_secs
+                    .or_else(|| env_u64("WEB_FETCH_TIMEOUT_SECS"))
+                    .unwrap_or(15)
+                    .clamp(3, 60),
+                user_scan_posts_limit: overrides
+                    .user_scan_posts_limit
+                    .or_else(|| env_u64("USER_SCAN_POSTS_LIMIT"))
+                    .unwrap_or(10)
+                    .clamp(1, 30),
+                user_scan_fact_cap: overrides
+                    .user_scan_fact_cap
+                    .or_else(|| env_usize("USER_SCAN_FACT_CAP"))
+                    .unwrap_or(3),
+                url_context_enabled: overrides.url_context_enabled.unwrap_or_else(|| {
+                    std::env::var("URL_CONTEXT_ENABLED")
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+                        .unwrap_or(true)
+                }),
+            },
         }
     }
 }
