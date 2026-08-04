@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod entities;
+mod faqs;
 mod gemini_client;
 mod models;
 mod qdrant_client;
@@ -246,7 +247,7 @@ async fn main() -> Result<()> {
             USER_PROFILES_COLLECTION_NAME,
             THINGS_KNOWLEDGE_COLLECTION_NAME
         );
-        if let Err(e) = seed_app_knowledge(&qdrant).await {
+        if let Err(e) = seed_app_knowledge(&qdrant, &gemini).await {
             warn!("Failed to seed Things app knowledge: {e}");
         }
         // Case-insensitive fact reads: converge any pre-normalization data.
@@ -1880,9 +1881,10 @@ async fn backfill_ancestors(
     chain
 }
 
-/// Upsert the curated `things_knowledge.json` seed facts into tier-3 memory.
-/// Idempotent (deterministic point ids); a missing file is not an error.
-async fn seed_app_knowledge(qdrant: &Arc<QdrantClient>) -> Result<()> {
+/// Upsert the curated `things_knowledge.json` seed facts plus every support
+/// FAQ's facts into tier-3 memory. Idempotent (deterministic point ids); a
+/// missing file is not an error. Runs on boot and after memory wipes.
+async fn seed_app_knowledge(qdrant: &Arc<QdrantClient>, gemini: &GeminiClient) -> Result<()> {
     let content = match std::fs::read_to_string(APP_KNOWLEDGE_SEED_FILE) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1911,6 +1913,10 @@ async fn seed_app_knowledge(qdrant: &Arc<QdrantClient>) -> Result<()> {
     let count = items.len();
     qdrant.upsert_app_facts(&items).await?;
     info!("Seeded {count} app-knowledge facts from {APP_KNOWLEDGE_SEED_FILE}");
+    // Support FAQs ride the same tier-3 collection (source = faq).
+    if let Err(e) = faqs::seed_support_faqs(qdrant, gemini).await {
+        warn!("Failed to seed support FAQs: {e}");
+    }
     Ok(())
 }
 

@@ -255,6 +255,8 @@ pub enum AppFactSource {
     Seed,
     /// Stated by a user in conversation (never authoritative).
     User,
+    /// Extracted from an admin-entered support FAQ (authoritative how-to).
+    Faq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,5 +400,18 @@ mod tests {
         let back: AppFactPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back.source, AppFactSource::Seed);
         assert_eq!(back.status, AppFactStatus::Active);
+    }
+
+    #[test]
+    fn app_fact_source_faq_roundtrips() {
+        assert_eq!(
+            serde_json::to_value(AppFactSource::Faq).unwrap(),
+            serde_json::json!("faq")
+        );
+        let back: AppFactSource = serde_json::from_value(serde_json::json!("faq")).unwrap();
+        assert_eq!(back, AppFactSource::Faq);
+        // Pre-existing points keep parsing.
+        let seed: AppFactSource = serde_json::from_value(serde_json::json!("seed")).unwrap();
+        assert_eq!(seed, AppFactSource::Seed);
     }
 }

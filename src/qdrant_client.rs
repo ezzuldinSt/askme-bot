@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use qdrant_client::qdrant::{
     points_selector::PointsSelectorOneOf, Condition, CreateCollectionBuilder,
-    CreateFieldIndexCollectionBuilder, Direction, FieldType, Filter, GetPointsBuilder, OrderBy,
-    PointId, PointStruct, PointsIdsList, QueryPointsBuilder, ScrollPointsBuilder,
-    SetPayloadPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Direction, FieldType, Filter,
+    GetPointsBuilder, OrderBy, PointId, PointStruct, PointsIdsList, QueryPointsBuilder,
+    ScrollPointsBuilder, SetPayloadPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::qdrant::Distance;
 use qdrant_client::Payload;
@@ -752,6 +752,25 @@ impl QdrantClient {
             ))
             .await
             .context("Failed to upsert app facts to Qdrant")?;
+        Ok(())
+    }
+
+    /// Delete app-knowledge points by id (used when a support FAQ is removed).
+    pub async fn delete_app_facts(&self, point_ids: &[Uuid]) -> Result<()> {
+        if point_ids.is_empty() {
+            return Ok(());
+        }
+        let client = self.client()?;
+        client
+            .delete_points(
+                DeletePointsBuilder::new(THINGS_KNOWLEDGE_COLLECTION_NAME.to_string())
+                    .points(PointsIdsList {
+                        ids: point_ids.iter().map(|id| id.to_string().into()).collect(),
+                    })
+                    .wait(true),
+            )
+            .await
+            .context("Failed to delete app facts from Qdrant")?;
         Ok(())
     }
 

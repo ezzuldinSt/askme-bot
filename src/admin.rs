@@ -156,6 +156,8 @@ pub struct AdminState {
     started_at: Instant,
     needs_restart: Arc<AtomicBool>,
     things_auth_cache: Arc<Mutex<Option<(Instant, bool)>>>,
+    /// Serializes FAQ read-modify-write cycles against concurrent panel clicks.
+    faqs_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AdminState {
@@ -173,6 +175,7 @@ impl AdminState {
             started_at: Instant::now(),
             needs_restart: Arc::new(AtomicBool::new(false)),
             things_auth_cache: Arc::new(Mutex::new(None)),
+            faqs_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -191,6 +194,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/password", post(change_password))
         .route("/api/status", get(status))
         .route("/api/config", get(get_config).put(put_config))
+        .route("/api/faqs", get(list_faqs).post(add_faq).delete(remove_faq))
         .route("/api/logs", get(get_logs))
         .route("/api/wipe", post(wipe))
         .route("/api/restart", post(restart))
@@ -736,6 +740,102 @@ async fn put_config(
     Ok(Json(json!({ "ok": true, "restart_required": restart_changed })))
 }
 
+// ── Support FAQs ──
+
+fn faq_json(f: &crate::faqs::SupportFaq) -> Value {
+    json!({
+        "id": f.id,
+        "question": f.question,
+        "answer": f.answer,
+        "facts": f.facts,
+        "created_at": f.created_at,
+    })
+}
+
+async fn list_faqs(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Value>> {
+    gate(&st).await?;
+    let qdrant_available = st.app.read().await.qdrant.is_available();
+    let faqs = crate::faqs::load();
+    Ok(Json(json!({
+        "faqs": faqs.iter().map(faq_json).collect::<Vec<_>>(),
+        "qdrant_available": qdrant_available,
+    })))
+}
+
+#[derive(Deserialize)]
+struct FaqCreate {
+    question: String,
+    answer: String,
+}
+
+async fn add_faq(
+    _: Auth,
+    State(st): State<AdminState>,
+    Json(req): Json<FaqCreate>,
+) -> ApiResult<Json<Value>> {
+    gate(&st).await?;
+    let question = req.question.trim();
+    let answer = req.answer.trim();
+    if question.chars().count() < 3 || answer.chars().count() < 3 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "question and answer must both be at least 3 characters",
+        );
+    }
+    if question.chars().count() > 1000 || answer.chars().count() > 4000 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "question is capped at 1000 chars, answer at 4000",
+        );
+    }
+    let (qdrant, gemini) = {
+        let app = st.app.read().await;
+        (app.qdrant.clone(), app.gemini.clone())
+    };
+    let _guard = st.faqs_lock.lock().await;
+    let (faq, synced) = crate::faqs::insert_faq(&qdrant, &gemini, question, answer)
+        .await
+        .map_err(|e| {
+            error!("FAQ insert failed: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("fact extraction failed: {e}") })),
+            )
+        })?;
+    info!("Support FAQ added via admin panel ({} facts)", faq.facts.len());
+    Ok(Json(json!({ "ok": true, "synced": synced, "faq": faq_json(&faq) })))
+}
+
+#[derive(Deserialize)]
+struct FaqDelete {
+    id: String,
+}
+
+async fn remove_faq(
+    _: Auth,
+    State(st): State<AdminState>,
+    Query(q): Query<FaqDelete>,
+) -> ApiResult<Json<Value>> {
+    gate(&st).await?;
+    let id = match Uuid::parse_str(q.id.trim()) {
+        Ok(id) => id,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "invalid FAQ id"),
+    };
+    let qdrant = st.app.read().await.qdrant.clone();
+    let _guard = st.faqs_lock.lock().await;
+    match crate::faqs::delete_faq(&qdrant, id).await {
+        Ok(Some(faq)) => {
+            info!("Support FAQ {id} deleted via admin panel");
+            Ok(Json(json!({ "ok": true, "deleted": faq_json(&faq) })))
+        }
+        Ok(None) => err(StatusCode::NOT_FOUND, "FAQ not found"),
+        Err(e) => {
+            error!("FAQ delete failed: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "failed to delete FAQ")
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct LogsQuery {
     after: Option<u64>,
@@ -774,7 +874,8 @@ async fn wipe(_: Auth, State(st): State<AdminState>, Json(req): Json<WipeRequest
                 error!("Memory wipe failed: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "wipe failed" })))
             })?;
-            if let Err(e) = crate::seed_app_knowledge(&qdrant).await {
+            let gemini = st.app.read().await.gemini.clone();
+            if let Err(e) = crate::seed_app_knowledge(&qdrant, &gemini).await {
                 warn!("Failed to re-seed app knowledge after wipe: {e}");
             }
             info!("Memory wiped via admin panel (processed markers kept)");
@@ -788,7 +889,8 @@ async fn wipe(_: Auth, State(st): State<AdminState>, Json(req): Json<WipeRequest
                 error!("Processed-marker wipe failed: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "wipe failed" })))
             })?;
-            if let Err(e) = crate::seed_app_knowledge(&qdrant).await {
+            let gemini = st.app.read().await.gemini.clone();
+            if let Err(e) = crate::seed_app_knowledge(&qdrant, &gemini).await {
                 warn!("Failed to re-seed app knowledge after wipe: {e}");
             }
             // The session cache must not shield old notifications either, and
@@ -948,11 +1050,19 @@ mod tests {
             new_log_buffer(),
         );
         let router = router(state);
-        let request = axum::http::Request::builder()
-            .uri("/api/status")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for (method, uri) in [
+            (axum::http::Method::GET, "/api/status"),
+            (axum::http::Method::GET, "/api/faqs"),
+            (axum::http::Method::POST, "/api/faqs"),
+            (axum::http::Method::DELETE, "/api/faqs?id=x"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
     }
 }

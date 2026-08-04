@@ -76,7 +76,7 @@
     position: sticky; top: 0; z-index: 20; backdrop-filter: blur(16px);
     background: rgba(10,14,22,.75); border-bottom: 1px solid var(--border);
   }
-  .header-inner { max-width: 1080px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; gap: 14px; }
+  .header-inner { max-width: 1080px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .logo-sm { width: 34px; height: 34px; border-radius: 10px; font-size: 17px; }
   .header-title { font-weight: 700; font-size: 16px; }
   .header-sub { font-size: 11px; color: var(--muted); }
@@ -89,23 +89,37 @@
   .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
   .dot.bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
   .dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
-  nav.tabs { max-width: 1080px; margin: 0 auto; padding: 0 24px; display: flex; gap: 4px; }
+  nav.tabs {
+    max-width: 1080px; margin: 0 auto; padding: 0 16px; display: flex; gap: 4px;
+    overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  nav.tabs::-webkit-scrollbar { display: none; }
   .tab {
     padding: 12px 16px; font-size: 14px; font-weight: 600; color: var(--muted); background: none; border: none;
-    border-bottom: 2px solid transparent; transition: color .15s;
+    border-bottom: 2px solid transparent; transition: color .15s; white-space: nowrap; flex: none;
   }
   .tab:hover { color: var(--text); }
   .tab.active { color: var(--text); border-bottom-color: var(--accent); }
-  main { max-width: 1080px; margin: 0 auto; padding: 26px 24px 60px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 16px 56px; }
+  @media (min-width: 680px) {
+    .header-inner { padding: 14px 24px; gap: 14px; }
+    nav.tabs { padding: 0 24px; }
+    main { padding: 26px 24px 60px; }
+  }
 
   .banner {
     display: flex; align-items: center; gap: 10px; padding: 12px 16px; margin-bottom: 20px;
     border-radius: 12px; background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.3);
     color: var(--warn); font-size: 13px; font-weight: 600;
   }
-  .grid { display: grid; gap: 16px; }
-  .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
-  .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .grid { display: grid; gap: 16px; grid-template-columns: 1fr; }
+  @media (min-width: 620px) {
+    .grid.cols-4 { grid-template-columns: repeat(2, 1fr); }
+    .grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (min-width: 1020px) {
+    .grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+  }
   .card {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 20px; backdrop-filter: blur(10px);
@@ -113,7 +127,7 @@
   .card h3 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
   .stat-value { font-size: 26px; font-weight: 800; letter-spacing: -.02em; }
   .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 14px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 14px; flex-wrap: wrap; }
   .row:last-child { border-bottom: none; }
   .row .k { color: var(--muted); }
   .row .v { font-weight: 600; font-family: var(--mono); font-size: 13px; }
@@ -138,7 +152,7 @@
   .logs-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
   .log-view {
     background: #070a10; border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px; height: 520px; overflow-y: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
+    padding: 16px; height: min(520px, 62vh); overflow-y: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
   }
   .log-line { white-space: pre-wrap; word-break: break-word; }
   .log-ts { color: #5b6376; }
@@ -165,11 +179,15 @@
   .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
 
   /* toasts */
-  #toasts { position: fixed; top: 18px; right: 18px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+  #toasts { position: fixed; top: 12px; right: 12px; left: 12px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
   .toast {
-    padding: 13px 18px; border-radius: 12px; font-size: 14px; font-weight: 600; max-width: 380px;
+    padding: 13px 18px; border-radius: 12px; font-size: 14px; font-weight: 600;
     background: var(--bg2); border: 1px solid var(--border); box-shadow: 0 14px 40px rgba(0,0,0,.5);
     animation: slidein .2s ease-out;
+  }
+  @media (min-width: 680px) {
+    #toasts { top: 18px; right: 18px; left: auto; }
+    .toast { max-width: 380px; }
   }
   .toast.ok { border-color: rgba(52,211,153,.4); color: var(--ok); }
   .toast.err { border-color: rgba(248,113,113,.4); color: var(--danger); }
@@ -178,6 +196,30 @@
   .danger-card { border-color: rgba(248,113,113,.25); }
   .danger-card h3 { color: var(--danger); }
   .form-error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
+
+  /* shared textarea */
+  .textarea {
+    width: 100%; padding: 11px 13px; border-radius: 10px; border: 1px solid var(--border);
+    background: rgba(255,255,255,.05); color: var(--text); outline: none; font-family: inherit;
+    font-size: 14px; line-height: 1.6; resize: vertical; transition: border-color .15s, background .15s;
+  }
+  .textarea:focus { border-color: var(--accent); background: rgba(124,108,255,.08); }
+  .textarea.mono { font-family: var(--mono); font-size: 13px; }
+
+  /* support FAQs */
+  .faq-item { margin-bottom: 14px; }
+  .faq-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .faq-head .btn { flex: none; }
+  .faq-q { font-weight: 700; font-size: 15px; line-height: 1.55; word-break: break-word; min-width: 0; }
+  .faq-a { color: var(--muted); font-size: 13.5px; line-height: 1.65; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+  .faq-facts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+  .faq-fact {
+    padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; line-height: 1.5;
+    background: rgba(52,211,153,.1); color: var(--ok); border: 1px solid rgba(52,211,153,.25);
+  }
+  .faq-empty { color: var(--muted); text-align: center; padding: 30px 0; font-size: 14px; }
+  .faq-pending { font-size: 12px; color: var(--warn); margin-top: 12px; font-weight: 600; }
+  button:disabled { opacity: .6; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -232,6 +274,7 @@
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="support">Support</button>
       <button class="tab" data-tab="config">Configuration</button>
       <button class="tab" data-tab="logs">Logs</button>
       <button class="tab" data-tab="security">Security</button>
@@ -250,6 +293,28 @@
       <div class="card"><div id="collections"></div></div>
       <div class="section-title">Live configuration</div>
       <div class="card"><div id="live-config"></div></div>
+    </section>
+
+    <!-- Support FAQs -->
+    <section id="tab-support" class="hidden">
+      <div id="faq-qdrant-warn" class="banner hidden">⚠️ Qdrant is unreachable — FAQs are saved, but their facts won't be searchable until it reconnects and the bot re-seeds.</div>
+      <div class="section-title">Add support FAQ <span class="chip ok">applies instantly</span></div>
+      <div class="card">
+        <div class="field">
+          <label>Question <span class="hint">how a user would ask it — any language</span></label>
+          <textarea id="faq-question" class="textarea" rows="2" dir="auto" maxlength="1000"
+            placeholder="e.g. How do I change my profile picture? / كيف أغير صورتي الشخصية؟"></textarea>
+        </div>
+        <div class="field">
+          <label>Official answer <span class="hint">the bot distills support facts from this and answers users with them</span></label>
+          <textarea id="faq-answer" class="textarea" rows="5" dir="auto" maxlength="4000"
+            placeholder="The canonical steps / rules / limits, as support would answer."></textarea>
+        </div>
+        <button class="btn btn-primary" style="width:auto" id="faq-add">Add FAQ &amp; extract facts</button>
+        <div class="form-error" id="faq-error"></div>
+      </div>
+      <div class="section-title">FAQs <span class="chip" id="faq-count"></span></div>
+      <div id="faq-list"></div>
     </section>
 
     <!-- Configuration -->
@@ -327,8 +392,7 @@
       <div class="section-title">Gemini API keys <span class="chip ok">applies instantly</span></div>
       <div class="card">
         <div class="field"><label>Key pool — one key per line <span class="hint">replies rotate round-robin; rate-limited keys cool down automatically</span></label>
-          <textarea id="cfg-gemini_api_keys" rows="4" spellcheck="false" autocomplete="off"
-            style="width:100%; padding:11px 13px; border-radius:10px; border:1px solid var(--border); background:rgba(255,255,255,.05); color:var(--text); outline:none; font-family:var(--mono); font-size:13px; resize:vertical;"></textarea>
+          <textarea id="cfg-gemini_api_keys" class="textarea mono" rows="4" spellcheck="false" autocomplete="off"></textarea>
           <div class="hint" id="cfg-keys-hint">Leave empty to keep the current pool. Paste keys to replace it entirely.</div></div>
       </div>
 
@@ -520,9 +584,10 @@ document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => switchTab(t
 function switchTab(tab) {
   state.tab = tab;
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
-  for (const s of ['dashboard', 'config', 'logs', 'security', 'danger']) $(`tab-${s}`).classList.toggle('hidden', s !== tab);
+  for (const s of ['dashboard', 'support', 'config', 'logs', 'security', 'danger']) $(`tab-${s}`).classList.toggle('hidden', s !== tab);
   clearInterval(state.logsTimer); clearInterval(state.dashTimer);
   if (tab === 'dashboard') { loadStatus(); state.dashTimer = setInterval(loadStatus, 10000); }
+  if (tab === 'support') loadFaqs();
   if (tab === 'config') loadConfig();
   if (tab === 'logs') { state.logsAfter = 0; state.logLines = []; renderLogs(); pollLogs(); state.logsTimer = setInterval(pollLogs, 2000); }
 }
@@ -629,6 +694,66 @@ $('config-save').onclick = async () => {
     else toast('Saved — applied instantly');
     loadConfig();
   } catch (e) { toast(e.message, 'err'); }
+};
+
+/* ── support faqs ── */
+async function loadFaqs() {
+  try {
+    const d = await apiJson('/api/faqs');
+    const list = d.faqs || [];
+    $('faq-count').textContent = list.length ? `${list.length}` : '';
+    $('faq-qdrant-warn').classList.toggle('hidden', !!d.qdrant_available);
+    $('faq-list').innerHTML = list.length ? list.map((f) => `
+      <div class="card faq-item">
+        <div class="faq-head">
+          <div class="faq-q" dir="auto">${esc(f.question)}</div>
+          <button class="btn btn-danger btn-sm" data-faq-del="${esc(f.id)}">Delete</button>
+        </div>
+        <div class="faq-a" dir="auto">${esc(f.answer)}</div>
+        ${f.facts && f.facts.length
+          ? `<div class="faq-facts">${f.facts.map((x) => `<span class="faq-fact" dir="auto">${esc(x)}</span>`).join('')}</div>`
+          : '<div class="faq-pending">⚠ No facts extracted yet — extraction retries on the next bot restart.</div>'}
+      </div>`).reverse().join('')
+      : '<div class="card"><div class="faq-empty">No support FAQs yet — add the first one above.</div></div>';
+    document.querySelectorAll('[data-faq-del]').forEach((b) => {
+      b.onclick = () => showModal({
+        title: 'Delete this FAQ?',
+        body: 'The FAQ and its extracted support facts are removed from memory immediately.',
+        confirmLabel: 'Delete',
+        onConfirm: async () => {
+          try {
+            await apiJson(`/api/faqs?id=${encodeURIComponent(b.dataset.faqDel)}`, { method: 'DELETE' });
+            toast('FAQ deleted');
+            loadFaqs();
+          } catch (e) { toast(e.message, 'err'); }
+        },
+      });
+    });
+  } catch (e) { /* handled in api() */ }
+}
+$('faq-add').onclick = async () => {
+  $('faq-error').textContent = '';
+  const question = $('faq-question').value.trim();
+  const answer = $('faq-answer').value.trim();
+  if (question.length < 3 || answer.length < 3) {
+    $('faq-error').textContent = 'Question and answer must both be at least 3 characters';
+    return;
+  }
+  const btn = $('faq-add');
+  btn.disabled = true;
+  btn.textContent = 'Extracting facts…';
+  try {
+    const d = await apiJson('/api/faqs', { method: 'POST', body: JSON.stringify({ question, answer }) });
+    $('faq-question').value = '';
+    $('faq-answer').value = '';
+    toast(d.synced ? 'FAQ added — facts are live immediately' : 'FAQ saved — facts will sync on the next bot restart');
+    loadFaqs();
+  } catch (e) {
+    $('faq-error').textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add FAQ & extract facts';
+  }
 };
 
 /* ── logs ── */
