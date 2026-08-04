@@ -90,6 +90,18 @@ pub fn is_auth_expired(err: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<AuthExpired>().is_some())
 }
 
+/// Raised on 4xx (non-401): the server validated and REJECTED the request,
+/// so nothing was committed. Callers can downcast to this to tell a
+/// definitive rejection (safe to retry with a corrected payload) apart from
+/// an ambiguous failure (timeout, 5xx) where the request may have committed.
+#[derive(Debug, thiserror::Error)]
+#[error("{context} (HTTP {status}): {body}")]
+pub struct ClientRejected {
+    pub status: StatusCode,
+    pub context: String,
+    pub body: String,
+}
+
 /// Internal error classification so the retry loop only retries failures that
 /// can actually heal on their own.
 enum RequestError {
@@ -121,11 +133,17 @@ fn http_error(status: StatusCode, context: &str, body: &[u8]) -> RequestError {
     // Error pages (404/500 HTML) can be kilobytes of markup; tool-facing
     // errors are fed back to the model, so keep only a snippet.
     let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
-    let err = anyhow::anyhow!("{context} (HTTP {status}): {text}");
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        RequestError::Retryable(err)
+        RequestError::Retryable(anyhow::anyhow!("{context} (HTTP {status}): {text}"))
     } else {
-        RequestError::Fatal(err)
+        RequestError::Fatal(
+            ClientRejected {
+                status,
+                context: context.to_string(),
+                body: text,
+            }
+            .into(),
+        )
     }
 }
 
@@ -678,6 +696,43 @@ mod tests {
             post_duration_string(two_weeks.0, two_weeks.1).as_deref(),
             Some("2w")
         );
+    }
+
+    #[test]
+    fn http_error_classifies_by_status() {
+        // 4xx -> Fatal carrying a downcastable ClientRejected.
+        let err: anyhow::Error =
+            http_error(StatusCode::UNPROCESSABLE_ENTITY, "Reply error", b"{\"errors\":{}}").into();
+        let rejected = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<ClientRejected>())
+            .expect("422 must surface as ClientRejected");
+        assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err
+            .to_string()
+            .contains("Reply error (HTTP 422 Unprocessable Entity)"));
+
+        // 5xx -> Retryable, and NOT a definitive rejection.
+        let err: anyhow::Error =
+            http_error(StatusCode::INTERNAL_SERVER_ERROR, "Reply error", b"oops").into();
+        assert!(
+            err.chain()
+                .all(|c| c.downcast_ref::<ClientRejected>().is_none()),
+            "5xx is ambiguous — never ClientRejected"
+        );
+
+        // 429 -> Retryable (heals on its own via the retry loop).
+        let err: anyhow::Error =
+            http_error(StatusCode::TOO_MANY_REQUESTS, "Reply error", b"").into();
+        assert!(
+            err.chain()
+                .all(|c| c.downcast_ref::<ClientRejected>().is_none()),
+            "429 is ambiguous for reply purposes — never ClientRejected"
+        );
+
+        // 401 -> AuthExpired.
+        let err: anyhow::Error = http_error(StatusCode::UNAUTHORIZED, "Reply error", b"").into();
+        assert!(is_auth_expired(&err));
     }
 
     #[test]

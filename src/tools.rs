@@ -487,6 +487,9 @@ impl ToolContext {
         let Some(user_id) = arg_u64(args, "user_id") else {
             return err("missing user_id argument");
         };
+        if user_id == 0 {
+            return err("user_id 0 is invalid — use a real id from search_users");
+        }
         match self.things.get_user(user_id).await {
             Ok(p) => json!({
                 "id": p.id,
@@ -511,6 +514,9 @@ impl ToolContext {
         let Some(user_id) = arg_u64(args, "user_id") else {
             return err("missing user_id argument");
         };
+        if user_id == 0 {
+            return err("user_id 0 is invalid — use a real id from search_users");
+        }
         let requested = arg_u64(args, "limit").unwrap_or(10);
         // Config knob caps the default; the tool declaration promises 1-10.
         let limit = requested

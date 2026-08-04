@@ -34,14 +34,17 @@ use crate::qdrant_models::{
     AppKnowledgeSeed, FactCategory, MemoryEntry, MessagePayload, MessageType, UserFactPayload,
     PROCESSED_COLLECTION_NAME, THINGS_KNOWLEDGE_COLLECTION_NAME, USER_PROFILES_COLLECTION_NAME,
 };
-use crate::things_client::{is_auth_expired, ThingsClient, TOKEN_FILE};
+use crate::things_client::{is_auth_expired, ClientRejected, ThingsClient, TOKEN_FILE};
 use crate::tools::{
     tool_declarations, ExtractionJob, ExtractionSource, ExtractionTask, FlowSubject, ToolContext,
 };
 
 const BOT_USERNAME: &str = "AskMe";
 const POLL_INTERVAL_MS: u64 = 3_000;
-const MAX_RESPONSE_LENGTH: usize = 8000;
+/// Reply text cap, in chars. Things rejects comment text over 2000 chars
+/// (HTTP 422); truncation appends '…', so 1999 + '…' lands exactly at the
+/// server's max.
+const MAX_RESPONSE_LENGTH: usize = 1999;
 const MAX_CONTEXT_DEPTH: usize = 20;
 const MAX_MEDIA_FILES: usize = 5;
 const MEMORY_WRITE_BATCH_SIZE: usize = 5;
@@ -1012,6 +1015,25 @@ async fn skip_notification(state: &Arc<RwLock<AppState>>, notification_id: u64) 
     ProcessOutcome::Skipped
 }
 
+/// Whether a failed reply-post is safe to retry. Retrying is only safe when
+/// the reply definitely never committed server-side: connect errors (the
+/// request never reached the server) and 4xx `ClientRejected` (the server
+/// validated and REJECTED the payload). Anything else (timeout after send,
+/// 5xx) is ambiguous — the reply may have been committed, and retrying would
+/// post a duplicate, which is worse than a lost retry.
+fn reply_error_is_safe_to_retry(e: &anyhow::Error) -> bool {
+    let never_sent = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .map(|re| re.is_connect())
+            .unwrap_or(false)
+    });
+    let rejected = e
+        .chain()
+        .any(|cause| cause.downcast_ref::<ClientRejected>().is_some());
+    never_sent || rejected
+}
+
 async fn process_notification(
     state: Arc<RwLock<AppState>>,
     notification: Notification,
@@ -1206,16 +1228,7 @@ async fn process_notification(
         Err(e) => {
             exit_if_auth_expired(&e);
             error!("Failed to post reply to {post_id}: {e}");
-            // Retry only when the request definitely never reached the server.
-            // Otherwise the reply may have been committed server-side and
-            // retrying would post a duplicate — worse than a lost retry.
-            let never_sent = e.chain().any(|cause| {
-                cause
-                    .downcast_ref::<reqwest::Error>()
-                    .map(|re| re.is_connect())
-                    .unwrap_or(false)
-            });
-            if never_sent {
+            if reply_error_is_safe_to_retry(&e) {
                 return ProcessOutcome::Failed;
             }
             warn!(
@@ -2886,6 +2899,49 @@ mod tests {
         let many: Vec<String> = (0..9).map(|i| format!("https://s{i}.example")).collect();
         assert_eq!(append_sources_footer("a", &many).lines().count(), 8, "1 text + 1 blank + 1 header + 5 urls");
         assert!(!append_sources_footer("a", &many).contains("https://s5.example"));
+    }
+
+    #[test]
+    fn reply_error_safe_to_retry_when_server_rejected() {
+        // 4xx: the server validated and REJECTED the payload — nothing was
+        // committed, so the notification should be retried, not poison-marked.
+        let err = anyhow::Error::new(ClientRejected {
+            status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            context: "Reply error".to_string(),
+            body: "comment too long".to_string(),
+        });
+        assert!(reply_error_is_safe_to_retry(&err));
+        // Still detected when wrapped in context layers.
+        let err = err.context("posting reply failed");
+        assert!(reply_error_is_safe_to_retry(&err));
+    }
+
+    #[test]
+    fn reply_error_not_safe_to_retry_when_ambiguous() {
+        // 5xx/timeout-style failures may have committed server-side — retrying
+        // would risk a duplicate reply.
+        let err = anyhow::anyhow!("Reply error (HTTP 500): Internal Server Error");
+        assert!(!reply_error_is_safe_to_retry(&err));
+    }
+
+    #[test]
+    fn reply_text_never_exceeds_things_comment_limit() {
+        // Things rejects comment text over 2000 chars (HTTP 422). The cap plus
+        // the truncation ellipsis must always land within the limit — even for
+        // a huge model answer with a full Sources footer.
+        const { assert!(MAX_RESPONSE_LENGTH < 2000) };
+        let long = "**Riyadh** ".repeat(500); // ~5500 chars of bold markup
+        let sources: Vec<String> = (0..5)
+            .map(|i| format!("https://source-{i}.example/very/long/url/path"))
+            .collect();
+        let combined = append_sources_footer(&long, &sources);
+        let (text, entities) = build_reply_with_entities(&combined, MAX_RESPONSE_LENGTH);
+        assert!(text.chars().count() <= 2000);
+        assert!(text.ends_with('…'));
+        let len = text.chars().count() as u64;
+        for e in &entities {
+            assert!(e.offset + e.length <= len, "entity span must stay in bounds");
+        }
     }
 
     #[test]
