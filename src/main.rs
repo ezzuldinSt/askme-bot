@@ -35,7 +35,7 @@ use crate::qdrant_models::{
 };
 use crate::things_client::{is_auth_expired, ThingsClient, TOKEN_FILE};
 use crate::tools::{
-    tool_declarations, ExtractionJob, ExtractionSource, FlowSubject, ToolContext,
+    tool_declarations, ExtractionJob, ExtractionSource, ExtractionTask, FlowSubject, ToolContext,
 };
 
 const BOT_USERNAME: &str = "AskMe";
@@ -69,7 +69,7 @@ struct AppState {
     gemini: GeminiClient,
     qdrant: Arc<QdrantClient>,
     memory_writer: mpsc::UnboundedSender<MemoryWrite>,
-    extraction_writer: mpsc::UnboundedSender<ExtractionJob>,
+    extraction_writer: mpsc::UnboundedSender<ExtractionTask>,
     /// Live, hot-reloadable configuration (panel saves swap it atomically).
     runtime: Arc<RwLock<RuntimeConfig>>,
     system_prompt: String,
@@ -88,6 +88,13 @@ enum ProcessOutcome {
     Skipped,
     /// Something transient failed; worth retrying on the next poll.
     Failed,
+    /// Every Gemini key was rate-limited/cooling down. Retried on the next
+    /// poll WITHOUT counting against MAX_PROCESS_ATTEMPTS: a quota cooldown
+    /// heals on its own (RPM in a minute, daily cap at midnight Pacific), and
+    /// poison-marking would lose the user's reply forever over a pause the
+    /// bot simply had to wait out. Costs nothing while keys stay parked —
+    /// no API call is made until one thaws.
+    RateLimited,
 }
 
 #[tokio::main]
@@ -242,6 +249,10 @@ async fn main() -> Result<()> {
         if let Err(e) = seed_app_knowledge(&qdrant).await {
             warn!("Failed to seed Things app knowledge: {e}");
         }
+        // Case-insensitive fact reads: converge any pre-normalization data.
+        if let Err(e) = qdrant.normalize_usernames().await {
+            warn!("Failed to normalize user-fact usernames: {e}");
+        }
     }
 
     let processed = load_processed_ids(&qdrant).await;
@@ -331,6 +342,19 @@ async fn main() -> Result<()> {
         .is_ok()
     {
         let _ = tokio::time::timeout(Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS), ack_rx).await;
+    }
+    // Drain queued fact-extraction jobs too (FIFO: the ack resolves once
+    // every queued job ahead of it has completed).
+    let (xack_tx, xack_rx) = oneshot::channel();
+    if state
+        .read()
+        .await
+        .extraction_writer
+        .send(ExtractionTask::Flush(xack_tx))
+        .is_ok()
+    {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS), xack_rx).await;
     }
     Ok(())
 }
@@ -745,6 +769,8 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
         let mut to_process = Vec::new();
         let mut known_processed = Vec::new();
         let mut irrelevant = Vec::new();
+        // Reply-target-uncertain post_replies: left unread, re-classified next poll.
+        let mut uncertain: HashSet<u64> = HashSet::new();
         {
             let state_read = state.read().await;
             for notification in &notifications {
@@ -760,14 +786,25 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
                     known_processed.push(notification.id);
                     continue;
                 }
-                if is_mention_notification(notification)
-                    || is_follow_up_notification(&state_read, notification).await
-                {
+                if is_mention_notification(notification) {
                     to_process.push(notification.clone());
-                } else {
-                    irrelevant.push(notification.id);
+                    continue;
+                }
+                match classify_follow_up(&state_read, notification).await {
+                    FollowUp::Yes => to_process.push(notification.clone()),
+                    FollowUp::No => irrelevant.push(notification.id),
+                    FollowUp::Unknown => {
+                        uncertain.insert(notification.id);
+                    }
                 }
             }
+        }
+        if !uncertain.is_empty() {
+            debug!(
+                "{} post_reply notification(s) have an unknown reply target \
+                 (payload lacks author info and memory is unreachable); leaving unread",
+                uncertain.len()
+            );
         }
         {
             let mut state_write = state.write().await;
@@ -797,6 +834,11 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
                 match handle.await {
                     Ok((id, ProcessOutcome::Replied)) | Ok((id, ProcessOutcome::Skipped)) => {
                         state.write().await.failures.remove(&id);
+                    }
+                    Ok((id, ProcessOutcome::RateLimited)) => {
+                        // Quota pause, not a real failure: stays unread and is
+                        // retried next poll, but never poison-marked.
+                        retry_later.insert(id);
                     }
                     Ok((id, ProcessOutcome::Failed)) => {
                         let attempts = {
@@ -832,11 +874,12 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
             }
 
             // Mark read everything we saw EXCEPT failures that will be
-            // retried — those stay unread so the next poll picks them up.
+            // retried (they stay unread so the next poll picks them up) and
+            // reply-target-uncertain items (re-classified next poll).
             let ids: Vec<u64> = notifications
                 .iter()
                 .map(|n| n.id)
-                .filter(|id| !retry_later.contains(id))
+                .filter(|id| !retry_later.contains(id) && !uncertain.contains(id))
                 .collect();
             if !ids.is_empty() {
                 let things = &state.read().await.things;
@@ -847,8 +890,13 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
             }
         } else {
             // Nothing actionable: still drain the unread count for everything
-            // we saw (likes, follows, already-handled items, ...).
-            let ids: Vec<u64> = notifications.iter().map(|n| n.id).collect();
+            // we saw (likes, follows, already-handled items, ...) — except
+            // reply-target-uncertain items, which stay unread.
+            let ids: Vec<u64> = notifications
+                .iter()
+                .map(|n| n.id)
+                .filter(|id| !uncertain.contains(id))
+                .collect();
             if !ids.is_empty() {
                 let things = &state.read().await.things;
                 if let Err(e) = things.mark_notifications_read(&ids).await {
@@ -866,37 +914,64 @@ fn is_mention_notification(notification: &Notification) -> bool {
     nt == "user_mention" || nt == "mention" || group == "mentions"
 }
 
+/// How confident the bot is that a notification is a reply to the bot itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowUp {
+    Yes,
+    No,
+    /// Cannot tell right now (payload carries no author info AND memory is
+    /// unreachable). Left unread and re-evaluated on the next poll — never
+    /// silently dropped, never marked read.
+    Unknown,
+}
+
 /// A follow-up is a reply to a post that AskMe itself wrote (detected from the
 /// notification payload, or from a `bot_reply` already persisted in Qdrant).
-async fn is_follow_up_notification(state: &AppState, notification: &Notification) -> bool {
+async fn classify_follow_up(state: &AppState, notification: &Notification) -> FollowUp {
     let nt = notification.notification_type.as_deref().unwrap_or("");
     if nt != "post_reply" {
-        return false;
+        return FollowUp::No;
     }
-    let Some(original_post) = notification.original_post_data.as_ref() else {
-        return false;
-    };
-    let Some(original_post_id) = original_post.id_value() else {
-        return false;
-    };
+    let original_post = notification.original_post_data.as_ref();
     // Only the unique username is trusted — display names are user-controlled
     // and anyone can call themselves "AskMe".
     let is_bot_author = original_post
-        .user
-        .as_ref()
+        .and_then(|p| p.user.as_ref())
         .and_then(|u| u.username.as_deref())
         .map(|u| u.eq_ignore_ascii_case(BOT_USERNAME))
         .unwrap_or(false);
     if is_bot_author {
-        return true;
+        return FollowUp::Yes;
     }
+    // The replied-to post's id, directly or via the reply's parent link.
+    let original_post_id = original_post
+        .and_then(|p| p.id_value())
+        .or_else(|| notification.reply_post_data.as_ref().and_then(|p| p.parent_id));
     let qdrant = state.qdrant.clone();
     if !qdrant.is_available() {
-        return false;
+        // Payload gave no answer and memory cannot arbitrate: unknown.
+        return if original_post_id.is_some() {
+            FollowUp::Unknown
+        } else {
+            FollowUp::No
+        };
     }
+    let Some(original_post_id) = original_post_id else {
+        return FollowUp::No;
+    };
     match qdrant.get_point(original_post_id).await {
-        Ok(Some(entry)) => entry.message_type == MessageType::BotReply,
-        _ => false,
+        Ok(Some(entry)) => {
+            if entry.message_type == MessageType::BotReply {
+                FollowUp::Yes
+            } else {
+                FollowUp::No
+            }
+        }
+        // Not in memory: positively not a bot reply (bot replies are stored
+        // synchronously right after posting).
+        Ok(None) => FollowUp::No,
+        // Memory lookup failed — retry next poll instead of dropping.
+        Err(_) => FollowUp::Unknown,
     }
 }
 
@@ -982,7 +1057,7 @@ async fn process_notification(
 
     let is_follow_up = {
         let state_read = state.read().await;
-        is_follow_up_notification(&state_read, &notification).await
+        matches!(classify_follow_up(&state_read, &notification).await, FollowUp::Yes)
     };
 
     let question = extract_question(&post);
@@ -1091,6 +1166,11 @@ async fn process_notification(
         }
         Err(e) => {
             error!("Gemini generation failed for notification {notification_id}: {e}");
+            if e.chain()
+                .any(|cause| cause.downcast_ref::<AllKeysRateLimited>().is_some())
+            {
+                return ProcessOutcome::RateLimited;
+            }
             return ProcessOutcome::Failed;
         }
     };
@@ -1173,13 +1253,13 @@ async fn process_notification(
             .read()
             .await
             .extraction_writer
-            .send(ExtractionJob {
+            .send(ExtractionTask::Job(ExtractionJob {
                 username: post.author_username().to_string(),
                 text: question.clone(),
                 post_id,
                 conversation_id,
                 source: ExtractionSource::Conversation,
-            });
+            }));
     }
 
     ProcessOutcome::Replied
@@ -1193,6 +1273,10 @@ fn extract_question(post: &Post) -> String {
 /// text on both sides. ASCII-case-insensitive and char-boundary safe (a
 /// whole-string `to_lowercase()` would shift byte offsets for characters like
 /// Turkish `İ` and could slice mid-character — panicking or corrupting text).
+///
+/// The `@` must start a token: preceded by nothing, whitespace, or punctuation
+/// — never by a word character or `/`, so URLs ("things.cv/@AskMe") and
+/// glued words ("x@AskMe") are left intact.
 fn strip_mention(content: &str) -> String {
     const MENTION: &[u8] = b"@askme";
     let bytes = content.as_bytes();
@@ -1203,8 +1287,17 @@ fn strip_mention(content: &str) -> String {
     while i < bytes.len() {
         // '@' is ASCII, so `i` is always a char boundary here.
         if bytes[i] == b'@' {
+            // Non-ASCII bytes (UTF-8 continuations, >= 0x80) never match this
+            // set, so a multi-byte character before '@' still counts as a
+            // token boundary.
+            let prev_ok = i == 0
+                || !matches!(
+                    bytes[i - 1],
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'/'
+                );
             let end = i + MENTION.len();
-            if end <= bytes.len()
+            if prev_ok
+                && end <= bytes.len()
                 && content.is_char_boundary(end)
                 && content[i..end].eq_ignore_ascii_case("@askme")
             {
@@ -1249,9 +1342,9 @@ fn collapse_spaces(s: &str) -> String {
 fn extract_media_urls(post: &Post) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
 
-    let mut push = |url: &String| {
-        if urls.len() < MAX_MEDIA_FILES && !urls.contains(url) {
-            urls.push(url.clone());
+    let mut push = |url: &str| {
+        if urls.len() < MAX_MEDIA_FILES && !urls.iter().any(|u| u == url) {
+            urls.push(url.to_string());
         }
     };
 
@@ -1278,6 +1371,31 @@ fn extract_media_urls(post: &Post) -> Vec<String> {
         for item in attachments {
             if let Some(ref url) = item.url {
                 push(url);
+            }
+        }
+    }
+    // Voice notes/audio arrive via a dedicated `audio` field (shape unknown —
+    // accept a single object or an array, with the usual url-ish keys).
+    fn audio_url(v: &Value) -> Option<&str> {
+        v.get("url")
+            .or_else(|| v.get("path"))
+            .or_else(|| v.get("src"))
+            .or_else(|| v.get("file_url"))
+            .and_then(|u| u.as_str())
+    }
+    if let Some(ref audio) = post.audio {
+        match audio {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(u) = audio_url(item) {
+                        push(u);
+                    }
+                }
+            }
+            other => {
+                if let Some(u) = audio_url(other) {
+                    push(u);
+                }
             }
         }
     }
@@ -1803,13 +1921,22 @@ fn spawn_extraction_worker(
     gemini: GeminiClient,
     qdrant: Arc<QdrantClient>,
     runtime: Arc<RwLock<RuntimeConfig>>,
-) -> mpsc::UnboundedSender<ExtractionJob> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ExtractionJob>();
+) -> mpsc::UnboundedSender<ExtractionTask> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ExtractionTask>();
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            // Snapshot the live config per job (panel edits apply immediately).
-            let config = runtime.read().await.clone();
-            run_extraction_job(&gemini, &qdrant, &config, job).await;
+        while let Some(task) = rx.recv().await {
+            match task {
+                ExtractionTask::Job(job) => {
+                    // Snapshot the live config per job (panel edits apply immediately).
+                    let config = runtime.read().await.clone();
+                    run_extraction_job(&gemini, &qdrant, &config, job).await;
+                }
+                // The channel is FIFO: resolving now means every queued job
+                // ahead of this Flush has completed.
+                ExtractionTask::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+            }
         }
     });
     tx
@@ -1852,13 +1979,18 @@ async fn run_extraction_job(
         // Exact restatement -> reinforce the existing point in place.
         match qdrant.get_user_fact(point_id).await {
             Ok(Some(existing)) => {
-                let patch = serde_json::json!({
-                    "last_seen": now,
-                    "times_confirmed": existing.times_confirmed.saturating_add(1),
-                    "active": true,
-                });
-                if let Err(e) = qdrant.patch_user_fact(point_id, patch).await {
-                    warn!("Failed to reinforce user fact {point_id}: {e}");
+                // A forgotten or superseded fact stays retired: an exact
+                // restatement must not silently resurrect it (forget is a
+                // deliberate user action; a supersede already has a live
+                // replacement fact).
+                if existing.active {
+                    let patch = serde_json::json!({
+                        "last_seen": now,
+                        "times_confirmed": existing.times_confirmed.saturating_add(1),
+                    });
+                    if let Err(e) = qdrant.patch_user_fact(point_id, patch).await {
+                        warn!("Failed to reinforce user fact {point_id}: {e}");
+                    }
                 }
                 continue;
             }
@@ -1867,6 +1999,16 @@ async fn run_extraction_job(
                 warn!("Failed to check user fact {point_id}: {e}");
                 continue;
             }
+        }
+
+        // Profile scans: stop once the cap is hit — BEFORE the supersede
+        // check below, so an over-cap fact never retires an existing one
+        // without inserting its replacement (reinforcing already-known facts
+        // above does not count against the cap).
+        if job.source == ExtractionSource::ProfileScan
+            && new_facts >= config.tools.user_scan_fact_cap
+        {
+            continue;
         }
 
         // Near-duplicate or contradiction -> retire the old fact, keep the new.
@@ -1901,14 +2043,6 @@ async fn run_extraction_job(
             }
             Ok(None) => {}
             Err(e) => warn!("Similarity check failed for user fact: {e}"),
-        }
-
-        // Profile scans: stop inserting once the cap is hit (keep reinforcing
-        // already-known facts, but do not keep adding brand-new ones).
-        if job.source == ExtractionSource::ProfileScan
-            && new_facts >= config.tools.user_scan_fact_cap
-        {
-            continue;
         }
 
         let payload = UserFactPayload {
@@ -2107,6 +2241,13 @@ enum ToolsFlowError {
     Failed(anyhow::Error),
 }
 
+/// Marker error for "every key in the pool is cooling down": distinguished
+/// from other generation failures so the poll loop never poison-marks a
+/// notification whose only problem is a temporary quota pause.
+#[derive(Debug, thiserror::Error)]
+#[error("all Gemini API keys are currently rate-limited")]
+struct AllKeysRateLimited;
+
 /// Run one reply generation flow with rate-limit failover across the key pool.
 ///
 /// The flow uses a sticky key lease: media uploads and the generation that
@@ -2177,6 +2318,7 @@ async fn generate_with_tools_failover(
             parts: {
                 let mut parts = vec![Part::Text {
                     text: user_text.to_string(),
+                    thought_signature: None,
                 }];
                 for (uri, mime) in &file_uris {
                     parts.push(Part::FileData {
@@ -2226,8 +2368,7 @@ async fn generate_with_tools_failover(
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| anyhow::anyhow!("all Gemini API keys are currently rate-limited")))
+    Err(last_err.unwrap_or_else(|| AllKeysRateLimited.into()))
 }
 
 /// The tool-calling loop on one lease: ask the model for a turn, execute any
@@ -2273,7 +2414,15 @@ async fn run_tool_rounds(
             // flow we first make sure its reply can draw on that user's saved
             // facts and a summary of their posts (fresh facts included).
             if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
-                contents.push(briefing);
+                // Keep the model's interim turn in the history (role
+                // alternation + its interim text stays visible), then brief.
+                if !turn.raw_parts.is_empty() {
+                    contents.push(Content {
+                        role: "model".to_string(),
+                        parts: turn.raw_parts.clone(),
+                    });
+                }
+                append_user_parts(contents, briefing.parts);
                 continue;
             }
             match turn.text {
@@ -2296,7 +2445,7 @@ async fn run_tool_rounds(
     // collected — tools withheld so it cannot keep looping. This guarantees a
     // reply instead of dropping the notification after exhausting rounds.
     if let Some(briefing) = build_user_briefing(gemini, tool_ctx).await {
-        contents.push(briefing);
+        append_user_parts(contents, briefing.parts);
     }
     let final_turn = match gemini
         .generate_turn_with(lease, system_prompt, contents, &[])
@@ -2327,19 +2476,45 @@ async fn build_user_briefing(gemini: &GeminiClient, tool_ctx: &ToolContext) -> O
         if subjects.iter().filter(|s| s.briefed).count() >= MAX_BRIEFED_SUBJECTS {
             return None;
         }
+        // A subject may carry only a user_id (e.g. a get_user_posts lookup of
+        // a user with zero visible posts returned no username) — resolve the
+        // username below instead of skipping the briefing entirely.
         let subject = subjects
             .iter_mut()
             .rev()
-            .find(|s| !s.briefed && s.username.is_some())?;
-        let username = subject.username.clone()?;
-        if username.eq_ignore_ascii_case(BOT_USERNAME) {
-            return None;
-        }
+            .find(|s| !s.briefed && (s.username.is_some() || s.user_id.is_some()))?;
+        let username = subject.username.clone();
         let user_id = subject.user_id;
         let posts = subject.posts.clone();
         subject.briefed = true;
         (username, user_id, posts)
     };
+
+    let username = match username {
+        Some(u) => u,
+        None => {
+            let id = user_id?;
+            match tool_ctx.things.get_user(id).await {
+                Ok(p) => {
+                    let resolved = p.username?;
+                    // Write it back so the extraction dedup below (which finds
+                    // subjects by username) matches this subject.
+                    let mut subjects = tool_ctx.flow_subjects.lock().unwrap();
+                    if let Some(s) = subjects.iter_mut().find(|s| s.user_id == Some(id)) {
+                        s.username = Some(resolved.clone());
+                    }
+                    resolved
+                }
+                Err(e) => {
+                    warn!("build_user_briefing: could not resolve username for user {id}: {e}");
+                    return None;
+                }
+            }
+        }
+    };
+    if username.eq_ignore_ascii_case(BOT_USERNAME) {
+        return None;
+    }
 
     let config = tool_ctx.runtime.read().await.clone();
 
@@ -2448,7 +2623,10 @@ async fn build_user_briefing(gemini: &GeminiClient, tool_ctx: &ToolContext) -> O
     );
     Some(Content {
         role: "user".to_string(),
-        parts: vec![Part::Text { text }],
+        parts: vec![Part::Text {
+            text,
+            thought_signature: None,
+        }],
     })
 }
 
@@ -2512,7 +2690,7 @@ async fn flush_pending_profile_scans(tool_ctx: &ToolContext, flushed: &mut HashS
             conversation_id: 0,
             source: ExtractionSource::ProfileScan,
         };
-        if tool_ctx.extraction_tx.send(job).is_err() {
+        if tool_ctx.extraction_tx.send(ExtractionTask::Job(job)).is_err() {
             warn!("Extraction worker gone; profile-scan facts for {username} not queued");
         } else {
             info!("Queued profile-scan fact extraction for {username}");
@@ -2526,9 +2704,13 @@ async fn flush_pending_profile_scans(tool_ctx: &ToolContext, flushed: &mut HashS
 /// Cost guards (quality-neutral — the model gets the same data either way):
 /// - identical calls within one turn are executed ONCE; repeats get a short
 ///   "cached" marker instead of a duplicated full result,
-/// - a call repeated in a later round (same name + args) is answered from
-///   `call_cache` with the same marker instead of re-executing and re-echoing
-///   a large result into the history.
+/// - a call repeated in a later round (same name + args) also gets the marker
+///   instead of re-executing and re-echoing a large result into the history —
+///   the original result is still in the conversation from its first round.
+///
+/// A turn with no function calls at all (only server-side toolCall/
+/// toolResponse parts) appends NO user content: an empty `parts` array is
+/// rejected by the API and would kill the whole reply flow.
 async fn append_tool_turn(
     turn: GenerateTurn,
     contents: &mut Vec<Content>,
@@ -2544,18 +2726,16 @@ async fn append_tool_turn(
         parts: turn.raw_parts.clone(),
     });
 
-    // Map each executed call (name + args) to its API-assigned id, so the
-    // functionResponse echoes it back (required for tool context circulation).
-    let mut id_by_key: HashMap<String, String> = HashMap::new();
+    // Pair each function call with its API-assigned id by position (parse_turn
+    // pushes raw_parts and function_calls in the same order). Each call's own
+    // id must echo on ITS response — required for tool context circulation.
+    let mut call_ids: Vec<Option<String>> = Vec::with_capacity(turn.function_calls.len());
     for part in &turn.raw_parts {
         if let Part::FunctionCall {
-            function_call,
-            ..
+            function_call, ..
         } = part
         {
-            if let Some(id) = &function_call.id {
-                id_by_key.insert(call_cache_key(&function_call.name, &function_call.args), id.clone());
-            }
+            call_ids.push(function_call.id.clone());
         }
     }
 
@@ -2589,20 +2769,14 @@ async fn append_tool_turn(
     let mut response_parts: Vec<Part> = Vec::new();
     for (i, call) in turn.function_calls.iter().enumerate() {
         let key = call_cache_key(&call.name, &call.args);
-        let response = if first_seen.get(&key) == Some(&i) {
-            match turn_results.get(&key).or_else(|| call_cache.get(&key)) {
-                Some(r) => r.clone(),
-                None => json!({ "error": "internal: missing tool result" }),
-            }
+        let response = if first_seen.get(&key) == Some(&i) && turn_results.contains_key(&key) {
+            // Fresh result from this turn's execution.
+            turn_results.get(&key).cloned().unwrap_or_default()
         } else {
-            json!({
-                "cached": true,
-                "note": format!(
-                    "This exact call to {}() with the same arguments was already executed \
-                     earlier in this conversation; the result shown above is unchanged.",
-                    call.name
-                ),
-            })
+            // Duplicate within this turn, or a repeat of an earlier round's
+            // call: the full result is already in the history — a marker is
+            // enough and keeps the context small.
+            cached_call_marker(&call.name)
         };
         info!(
             "Tool {}({}) -> {}",
@@ -2614,13 +2788,43 @@ async fn append_tool_turn(
             function_response: FunctionResponseData {
                 name: call.name.clone(),
                 response,
-                id: id_by_key.get(&key).cloned(),
+                id: call_ids.get(i).cloned().flatten(),
             },
         });
     }
+    // Server-side-only turns (no function calls) must not produce an empty
+    // user content — the API rejects empty parts arrays.
+    if !response_parts.is_empty() {
+        contents.push(Content {
+            role: "user".to_string(),
+            parts: response_parts,
+        });
+    }
+}
+
+/// The one-line answer for a call whose full result is already in the history.
+fn cached_call_marker(name: &str) -> Value {
+    json!({
+        "cached": true,
+        "note": format!(
+            "This exact call to {name}() with the same arguments was already executed \
+             earlier in this conversation; the result shown above is unchanged."
+        ),
+    })
+}
+
+/// Append parts as a user-role content, merging into the trailing user
+/// content when there is one (keeps the history alternating user/model).
+fn append_user_parts(contents: &mut Vec<Content>, parts: Vec<Part>) {
+    if let Some(last) = contents.last_mut() {
+        if last.role == "user" {
+            last.parts.extend(parts);
+            return;
+        }
+    }
     contents.push(Content {
         role: "user".to_string(),
-        parts: response_parts,
+        parts,
     });
 }
 
@@ -3066,5 +3270,188 @@ mod tests {
             format_ancestor_chain(&chain, 2),
             "\n[Conversation above]\nb: middle\nc: direct parent"
         );
+    }
+
+    // ── Tool-turn handling (bugs #1, #6, #11) ──
+
+    use crate::gemini_client::FunctionCallTurn;
+    use crate::models::{FunctionCallData, ToolCallData, ToolResponseData};
+
+    fn test_tool_ctx() -> ToolContext {
+        let gemini = GeminiClient::new("test-key".to_string());
+        let qdrant = Arc::new(QdrantClient::unavailable(Arc::new(gemini), 4));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ToolContext::new(
+            Arc::new(ThingsClient::new()),
+            qdrant,
+            Arc::new(RwLock::new(RuntimeConfig {
+                memory: config::MemoryConfig {
+                    user_facts_limit: 8,
+                    app_knowledge_limit: 3,
+                    app_knowledge_min_score: 0.72,
+                    user_fact_supersede_threshold: 0.85,
+                    forget_similarity_threshold: 0.80,
+                    fact_extraction_enabled: true,
+                },
+                context_depth_limit: 20,
+                tools: config::ToolsConfig {
+                    enabled: true,
+                    max_rounds: 6,
+                    web_fetch_max_bytes: 512_000,
+                    web_fetch_timeout_secs: 15,
+                    user_scan_posts_limit: 10,
+                    user_scan_fact_cap: 3,
+                    url_context_enabled: true,
+                },
+            })),
+            tx,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    fn facts_call_turn(id: &str) -> GenerateTurn {
+        GenerateTurn {
+            text: None,
+            function_calls: vec![FunctionCallTurn {
+                name: "get_user_facts".to_string(),
+                args: json!({ "username": "khalid" }),
+            }],
+            retrieved_urls: vec![],
+            raw_parts: vec![Part::FunctionCall {
+                function_call: FunctionCallData {
+                    name: "get_user_facts".to_string(),
+                    args: json!({ "username": "khalid" }),
+                    id: Some(id.to_string()),
+                },
+                thought_signature: None,
+            }],
+        }
+    }
+
+    /// Bug #1: a turn of only server-side tool parts (no function calls) must
+    /// NOT append an empty user content — the API rejects empty parts.
+    #[tokio::test]
+    async fn server_side_only_turn_adds_no_empty_user_content() {
+        let ctx = test_tool_ctx();
+        let turn = GenerateTurn {
+            text: None,
+            function_calls: vec![],
+            retrieved_urls: vec![],
+            raw_parts: vec![
+                Part::ToolCall {
+                    tool_call: ToolCallData {
+                        tool_type: "url_context".to_string(),
+                        args: json!({}),
+                        id: Some("t1".to_string()),
+                    },
+                    thought_signature: None,
+                },
+                Part::ToolResponse {
+                    tool_response: ToolResponseData {
+                        tool_type: "url_context".to_string(),
+                        response: json!({}),
+                        id: Some("t1".to_string()),
+                    },
+                    thought_signature: None,
+                },
+            ],
+        };
+        let mut contents = Vec::new();
+        let mut cache = HashMap::new();
+        append_tool_turn(turn, &mut contents, &ctx, &mut cache).await;
+        assert_eq!(contents.len(), 1, "only the model turn is appended");
+        assert_eq!(contents[0].role, "model");
+        assert_eq!(contents[0].parts.len(), 2);
+    }
+
+    /// Bug #6: a call repeated in a LATER round gets the short marker (its
+    /// full result is already in the history), not a re-echoed full result.
+    /// Bug #11: every response echoes its OWN call id.
+    #[tokio::test]
+    async fn repeated_call_in_later_round_gets_marker_and_own_id() {
+        let ctx = test_tool_ctx();
+        let mut contents = Vec::new();
+        let mut cache = HashMap::new();
+
+        append_tool_turn(facts_call_turn("call-1"), &mut contents, &ctx, &mut cache).await;
+        let Part::FunctionResponse { function_response } = &contents[1].parts[0] else {
+            panic!("expected a function response part");
+        };
+        assert!(
+            function_response.response.get("error").is_some(),
+            "qdrant unavailable -> the executed error result"
+        );
+        assert_eq!(function_response.id.as_deref(), Some("call-1"));
+
+        append_tool_turn(facts_call_turn("call-2"), &mut contents, &ctx, &mut cache).await;
+        let Part::FunctionResponse { function_response } = &contents[3].parts[0] else {
+            panic!("expected a function response part");
+        };
+        assert_eq!(
+            function_response.response.get("cached"),
+            Some(&json!(true)),
+            "repeat of an earlier round gets the marker"
+        );
+        assert!(
+            function_response.response.get("error").is_none(),
+            "marker replaces the full result, not re-echoes it"
+        );
+        assert_eq!(function_response.id.as_deref(), Some("call-2"));
+    }
+
+    /// Bug #10: briefings merge into a trailing user content instead of
+    /// creating two consecutive user contents.
+    #[test]
+    fn append_user_parts_merges_into_trailing_user_content() {
+        let text = |s: &str| Part::Text {
+            text: s.to_string(),
+            thought_signature: None,
+        };
+        let mut contents = vec![Content {
+            role: "user".to_string(),
+            parts: vec![text("a")],
+        }];
+        append_user_parts(&mut contents, vec![text("b")]);
+        assert_eq!(contents.len(), 1, "merged into the trailing user content");
+        assert_eq!(contents[0].parts.len(), 2);
+
+        contents.push(Content {
+            role: "model".to_string(),
+            parts: vec![],
+        });
+        append_user_parts(&mut contents, vec![text("c")]);
+        assert_eq!(contents.len(), 3, "new user content after a model turn");
+        assert_eq!(contents[2].role, "user");
+    }
+
+    /// Bug #9: mentions embedded in URLs or glued to words are not stripped.
+    #[test]
+    fn strip_mention_leaves_urls_and_glued_words_intact() {
+        assert_eq!(
+            strip_mention("see https://things.cv/@AskMe now"),
+            "see https://things.cv/@AskMe now"
+        );
+        assert_eq!(strip_mention("x@AskMe"), "x@AskMe");
+        assert_eq!(strip_mention("user_1@askme"), "user_1@askme");
+        // Punctuation before the mention still counts as a token boundary.
+        assert_eq!(strip_mention("(@AskMe) hi"), "() hi");
+    }
+
+    /// Bug #13: voice notes carried by the `audio` field are picked up.
+    #[test]
+    fn extract_media_urls_includes_audio_field() {
+        let mut post = post_with_id(1);
+        post.audio = Some(json!({ "url": "https://cdn.things.cv/voice1.ogg" }));
+        assert_eq!(
+            extract_media_urls(&post),
+            vec!["https://cdn.things.cv/voice1.ogg".to_string()]
+        );
+        post.audio = Some(json!([{ "path": "https://cdn.things.cv/voice2.ogg" }]));
+        assert_eq!(
+            extract_media_urls(&post),
+            vec!["https://cdn.things.cv/voice2.ogg".to_string()]
+        );
+        post.audio = Some(json!({ "unrelated": true }));
+        assert!(extract_media_urls(&post).is_empty());
     }
 }

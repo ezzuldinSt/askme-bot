@@ -431,7 +431,11 @@ impl QdrantClient {
             .await?;
         let mut entries: Vec<MemoryEntry> =
             points.into_iter().filter_map(|(_, p)| p).collect();
-        entries.sort_by_key(|e| e.timestamp);
+        // Chronological order, oldest first. The id tie-break keeps same-
+        // second entries in posting order too (Things ids grow over time);
+        // a plain timestamp sort would leave ties in the fetched (newest-
+        // first) order.
+        entries.sort_by_key(|e| (e.timestamp, e.id));
         Ok(entries)
     }
 
@@ -471,10 +475,16 @@ impl QdrantClient {
     // ── Tier 2: per-user durable facts ──
 
     /// Insert (or fully replace) a user fact, embedding the fact text.
+    ///
+    /// The stored `username` is lowercased: keyword filters are exact-match,
+    /// and fact point ids already normalize case — so reads must be able to
+    /// assume one canonical (case-insensitive) form.
     pub async fn upsert_user_fact(&self, point_id: Uuid, payload: &UserFactPayload) -> Result<()> {
         let client = self.client()?;
+        let mut payload = payload.clone();
+        payload.username = unorm(&payload.username);
         let vector = self.embed(&payload.fact).await?;
-        let json = serde_json::to_value(payload)
+        let json = serde_json::to_value(&payload)
             .unwrap_or_else(|_| serde_json::json!({ "fact": payload.fact }));
         let point = PointStruct::new(
             point_id.to_string(),
@@ -539,7 +549,7 @@ impl QdrantClient {
     ) -> Result<Vec<(Uuid, UserFactPayload)>> {
         let client = self.client()?;
         let filter = Filter::all([
-            Condition::matches("username", username.to_string()),
+            Condition::matches("username", unorm(username)),
             Condition::matches("active", true),
         ]);
         let points = self
@@ -561,10 +571,48 @@ impl QdrantClient {
             .collect())
     }
 
+    /// One-time migration: lowercase the stored `username` of every ACTIVE
+    /// user fact written before reads became case-insensitive. New writes are
+    /// normalized at insert time, so this converges old data in the
+    /// background and becomes a no-op once everything is normalized.
+    pub async fn normalize_usernames(&self) -> Result<()> {
+        let client = self.client()?;
+        let filter = Filter::all([Condition::matches("active", true)]);
+        let points = self
+            .scroll_raw::<UserFactPayload>(
+                &client,
+                USER_PROFILES_COLLECTION_NAME,
+                filter,
+                None,
+                100_000,
+            )
+            .await?;
+        let mut fixed = 0usize;
+        for (id, payload) in points {
+            let (Some(id), Some(p)) = (id.and_then(point_id_uuid), payload) else {
+                continue;
+            };
+            let lower = unorm(&p.username);
+            if lower != p.username {
+                if let Err(e) = self
+                    .patch_user_fact(id, serde_json::json!({ "username": lower }))
+                    .await
+                {
+                    warn!("Failed to normalize username on fact {id}: {e}");
+                } else {
+                    fixed += 1;
+                }
+            }
+        }
+        if fixed > 0 {
+            info!("Normalized username casing on {fixed} user facts");
+        }
+        Ok(())
+    }
+
     /// Find the most similar ACTIVE fact of the same user above `threshold`
     /// (used for contradiction/supersede detection).
-    pub async fn find_similar_user_fact(
-        &self,
+    pub async fn find_similar_user_fact(        &self,
         username: &str,
         vector: &[f32],
         threshold: f32,
@@ -629,7 +677,7 @@ impl QdrantClient {
     ) -> Result<Vec<(Uuid, UserFactPayload)>> {
         let client = self.client()?;
         let filter = Filter::all([
-            Condition::matches("username", username.to_string()),
+            Condition::matches("username", unorm(username)),
             Condition::matches("active", true),
         ]);
         let builder = QueryPointsBuilder::new(USER_PROFILES_COLLECTION_NAME.to_string())
@@ -793,8 +841,13 @@ impl QdrantClient {
         Ok(!response.result.is_empty())
     }
 
-    /// List every processed notification id (used to seed the session cache).
+    /// List processed notification ids (used to seed the session cache).
+    /// Capped: Qdrant remains the source of truth (every unprocessed
+    /// notification is checked individually anyway), so there is no reason to
+    /// load an ever-growing history into memory on every boot.
     pub async fn list_processed(&self) -> Result<Vec<u64>> {
+        /// Safety-net cache size; older markers fall back to per-item lookups.
+        const MAX_SEEDED_IDS: usize = 10_000;
         let client = self.client()?;
         let mut ids = Vec::new();
         let mut offset: Option<PointId> = None;
@@ -811,6 +864,13 @@ impl QdrantClient {
                 if let Some(id) = point.id.and_then(point_id_num) {
                     ids.push(id);
                 }
+            }
+            if ids.len() >= MAX_SEEDED_IDS {
+                warn!(
+                    "Processed-marker history exceeds {MAX_SEEDED_IDS}; seeding the session \
+                     cache with the first page only (older markers are checked on demand)"
+                );
+                break;
             }
             match response.next_page_offset {
                 Some(next) => offset = Some(next),
@@ -936,6 +996,13 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Canonical username form for storage and filtering: Things usernames are
+/// case-insensitive, but Qdrant keyword matches are exact — so every write
+/// and every read goes through this one normalization point.
+fn unorm(username: &str) -> String {
+    username.trim().to_lowercase()
+}
+
 /// Extract the numeric id of a Qdrant point (returns `None` for UUID points,
 /// which conversation points never are).
 fn point_id_num(point_id: PointId) -> Option<u64> {
@@ -988,10 +1055,16 @@ mod tests {
         });
     }
 
+    #[test]
+    fn unorm_normalizes_case_and_surrounding_whitespace() {
+        assert_eq!(unorm("Khaled"), "khaled");
+        assert_eq!(unorm("  KHALED "), "khaled");
+        assert_eq!(unorm("khaled"), "khaled");
+    }
+
     struct FakeEmbedder;
     #[async_trait::async_trait]
-    impl Embedder for FakeEmbedder {
-        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    impl Embedder for FakeEmbedder {        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             Ok(texts
                 .iter()
                 .map(|t| {

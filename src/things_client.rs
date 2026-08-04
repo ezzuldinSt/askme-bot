@@ -13,6 +13,36 @@ const THINGS_API_BASE: &str = "https://things.cv/api";
 pub const TOKEN_FILE: &str = ".token.json";
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1000;
+/// Largest attachment the bot will download for a reply (Gemini upload
+/// staging is in-memory, so unbounded downloads are a memory hazard).
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Read a response body into memory, stopping at `max` bytes. Returns the
+/// (possibly truncated) body and whether truncation happened — the cap is
+/// enforced DURING the download, not after, so a huge page/file can never
+/// be fully buffered.
+pub(crate) async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    max: usize,
+) -> Result<(Vec<u8>, bool)> {
+    let declared = resp.content_length().map(|n| n as usize);
+    let mut buf: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(max));
+    let mut truncated = declared.map(|n| n > max).unwrap_or(false);
+    while let Some(chunk) = resp.chunk().await.context("Failed to read response body")? {
+        let remaining = max.saturating_sub(buf.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, truncated))
+}
 
 /// Post type used for bot replies. "b" is the code the Things app's own post
 /// composer sends; the bot previously used "r" (reply). Keeping the app's code
@@ -498,7 +528,7 @@ impl ThingsClient {
     }
 
     pub async fn download_media(&self, url: &str) -> Result<(Vec<u8>, String)> {
-        let resp = self
+        let mut resp = self
             .client
             .get(url)
             .timeout(Duration::from_secs(30))
@@ -521,12 +551,20 @@ impl ThingsClient {
             .unwrap_or("application/octet-stream")
             .to_string();
 
-        let bytes = resp.bytes().await.context("Failed to read media bytes")?;
+        let (bytes, truncated) = read_body_capped(&mut resp, MAX_MEDIA_DOWNLOAD_BYTES).await?;
+        if truncated {
+            // Partial media (e.g. half a video) is useless to the model —
+            // skip this attachment entirely rather than uploading corrupt data.
+            anyhow::bail!(
+                "Media exceeds the {} MB cap; skipped: {url}",
+                MAX_MEDIA_DOWNLOAD_BYTES / (1024 * 1024)
+            );
+        }
 
         let len = bytes.len();
         info!("Downloaded {len} bytes from {url} (type: {content_type})");
 
-        Ok((bytes.to_vec(), content_type))
+        Ok((bytes, content_type))
     }
 
     fn auth_headers(&self) -> Result<reqwest::header::HeaderMap> {

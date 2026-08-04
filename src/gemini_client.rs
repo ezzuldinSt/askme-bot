@@ -158,7 +158,12 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
     for part in parts {
         if let Some(t) = part.text {
             text.push_str(&t);
-            raw_parts.push(Part::Text { text: t });
+            // Text parts can carry thought signatures (sometimes on an EMPTY
+            // text part); circulate them verbatim like every other part type.
+            raw_parts.push(Part::Text {
+                text: t,
+                thought_signature: part.thought_signature.clone(),
+            });
         }
         if let Some(fc) = part.function_call {
             function_calls.push(FunctionCallTurn {
@@ -747,6 +752,7 @@ impl GeminiClient {
 
         parts.push(Part::Text {
             text: user_text.to_string(),
+            thought_signature: None,
         });
 
         for (uri, mime) in file_uris {
@@ -762,6 +768,7 @@ impl GeminiClient {
             system_instruction: Some(SystemInstruction {
                 parts: vec![Part::Text {
                     text: system_prompt.to_string(),
+                    thought_signature: None,
                 }],
             }),
             contents: vec![Content {
@@ -885,11 +892,12 @@ impl GeminiClient {
             system_instruction: Some(SystemInstruction {
                 parts: vec![Part::Text {
                     text: system_prompt.to_string(),
+                    thought_signature: None,
                 }],
             }),
             contents: contents.to_vec(),
             tools: (!tools.is_empty()).then(|| tools.to_vec()),
-            tool_config: has_builtin_tool.then(|| ToolConfig {
+            tool_config: has_builtin_tool.then_some(ToolConfig {
                 include_server_side_tool_invocations: true,
             }),
             generation_config: {
@@ -985,7 +993,10 @@ impl GeminiClient {
                 model: format!("models/{}", self.embedding_model),
                 content: Content {
                     role: "user".to_string(),
-                    parts: vec![Part::Text { text: text.clone() }],
+                    parts: vec![Part::Text {
+                        text: text.clone(),
+                        thought_signature: None,
+                    }],
                 },
                 taskType: Some("SEMANTIC_SIMILARITY".to_string()),
                 outputDimensionality: Some(self.embedding_dimensions),
@@ -1554,6 +1565,7 @@ mod tests {
                 text: "What is the main heading of https://en.wikipedia.org/wiki/UEFA_Euro_2024_final ? \
                        Then call get_fact with query \"euro\". Answer in one sentence after the tool result."
                     .to_string(),
+                thought_signature: None,
             }],
         }];
         let mut sources: Vec<String> = Vec::new();

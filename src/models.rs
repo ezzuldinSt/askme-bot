@@ -399,7 +399,15 @@ pub struct Content {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Part {
-    Text { text: String },
+    Text {
+        text: String,
+        /// Gemini 3 models may attach a thought signature to ANY part type
+        /// (including text — sometimes an empty text part). It must be echoed
+        /// back verbatim when the turn is circulated, or the API rejects the
+        /// next request in a function-calling flow.
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
     FileData { file_data: FileData },
     InlineData { inline_data: InlineData },
     /// Echo of a model functionCall back into history. Thinking models attach

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{info, warn};
 
 use crate::config::RuntimeConfig;
@@ -36,6 +36,14 @@ pub struct ExtractionJob {
     pub post_id: u64,
     pub conversation_id: u64,
     pub source: ExtractionSource,
+}
+
+/// Work item for the extraction worker. The channel is FIFO, so a `Flush`
+/// only resolves after every queued job ahead of it has completed — used to
+/// drain pending extractions before shutdown.
+pub enum ExtractionTask {
+    Job(ExtractionJob),
+    Flush(oneshot::Sender<()>),
 }
 
 /// A user the model looked up during one reply flow (profile/posts/facts).
@@ -114,7 +122,7 @@ pub struct ToolContext {
     pub things: Arc<ThingsClient>,
     pub qdrant: Arc<QdrantClient>,
     pub runtime: Arc<RwLock<RuntimeConfig>>,
-    pub extraction_tx: mpsc::UnboundedSender<ExtractionJob>,
+    pub extraction_tx: mpsc::UnboundedSender<ExtractionTask>,
     /// Users the model looked up during this reply flow (shared with the
     /// reply flow itself, which may auto-brief the model on them).
     pub flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
@@ -125,7 +133,7 @@ impl ToolContext {
         things: Arc<ThingsClient>,
         qdrant: Arc<QdrantClient>,
         runtime: Arc<RwLock<RuntimeConfig>>,
-        extraction_tx: mpsc::UnboundedSender<ExtractionJob>,
+        extraction_tx: mpsc::UnboundedSender<ExtractionTask>,
         flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
     ) -> Self {
         Self {
@@ -367,12 +375,13 @@ impl ToolContext {
             return err(format!("not a text page (content type: {content_type})"));
         }
 
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => return err(format!("failed to read page: {e}")),
-        };
-        let oversized = bytes.len() > max_bytes;
-        let raw = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]);
+        // Enforce the byte cap DURING the download (never buffer a huge page).
+        let (bytes, oversized) =
+            match crate::things_client::read_body_capped(&mut resp, max_bytes).await {
+                Ok(r) => r,
+                Err(e) => return err(format!("failed to read page: {e}")),
+            };
+        let raw = String::from_utf8_lossy(&bytes);
 
         let (title, text) = if content_type.contains("json") {
             (String::new(), raw.trim().to_string())
