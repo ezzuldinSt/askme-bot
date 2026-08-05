@@ -800,19 +800,16 @@ impl QdrantClient {
         Ok(())
     }
 
-    /// List the `(id, parent_id)` of the most recent `max` conversation
-    /// messages, newest first. The deleted-post sweeper verifies each of these
-    /// against the Things API.
+    /// List the `(id, parent_id)` of conversation messages (capped at `max`).
+    /// The deleted-post sweeper verifies each of these against the Things API.
+    ///
+    /// Deliberately UNORDERED: plain id-offset pagination walks the whole
+    /// collection, while `order_by` pagination (used by the context readers,
+    /// which stay under one page) would silently stop after the first page.
     pub async fn list_conversation_refs(&self, max: u64) -> Result<Vec<(u64, Option<u64>)>> {
         let client = self.client()?;
         let points = self
-            .scroll_raw::<MemoryEntry>(
-                &client,
-                &self.collection.clone(),
-                Filter::default(),
-                Some(("timestamp", Direction::Desc)),
-                max,
-            )
+            .scroll_raw::<MemoryEntry>(&client, &self.collection.clone(), Filter::default(), None, max)
             .await?;
         Ok(points
             .into_iter()
