@@ -396,10 +396,17 @@
       </div>
 
       <div class="section-title">Gemini API keys <span class="chip ok">applies instantly</span></div>
-      <div class="card">
-        <div class="field"><label>Key pool — one key per line <span class="hint">replies rotate round-robin; rate-limited keys cool down automatically</span></label>
-          <textarea id="cfg-gemini_api_keys" class="textarea mono" rows="4" spellcheck="false" autocomplete="off"></textarea>
-          <div class="hint" id="cfg-keys-hint">Leave empty to keep the current pool. Paste keys to replace it entirely.</div></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="field"><label>Add keys — one per line <span class="hint">appended to the pool; duplicates ignored</span></label>
+            <textarea id="cfg-gemini_api_keys_add" class="textarea mono" rows="4" spellcheck="false" autocomplete="off"></textarea>
+            <div class="hint" id="cfg-keys-current">Current pool: —</div></div>
+        </div>
+        <div class="card">
+          <div class="field"><label>Replace entire pool — one per line <span class="hint">advanced: overwrites the pool; wins over "Add keys" if both are filled</span></label>
+            <textarea id="cfg-gemini_api_keys" class="textarea mono" rows="4" spellcheck="false" autocomplete="off"></textarea>
+            <div class="hint" id="cfg-keys-hint">Leave empty to keep the current pool.</div></div>
+        </div>
       </div>
 
       <div class="section-title">Boot-time settings <span class="chip warn">requires restart</span></div>
@@ -670,10 +677,12 @@ async function loadConfig() {
     $('cfg-url_context_enabled').checked = d.hot.tools.url_context_enabled;
     $('cfg-thinking_level').value = d.hot.thinking_level ?? 'default';
     $('cfg-gemini_api_keys').value = '';
+    $('cfg-gemini_api_keys_add').value = '';
+    $('cfg-keys-current').textContent = d.restart.gemini_keys_masked.length
+      ? `Current pool: ${d.restart.gemini_keys_masked.join('  ')}`
+      : 'Current pool: empty — no keys configured';
     $('cfg-gemini_api_keys').placeholder = `${d.restart.gemini_keys_count} key(s) in pool — paste to replace`;
-    $('cfg-keys-hint').textContent = d.restart.gemini_keys_masked.length
-      ? `Current pool: ${d.restart.gemini_keys_masked.join('  ')} — leave empty to keep, paste to replace entirely.`
-      : 'Leave empty to keep the current pool. Paste keys to replace it entirely.';
+    $('cfg-keys-hint').textContent = 'Leave empty to keep the current pool. Paste keys to replace it entirely.';
     $('cfg-qdrant_url').value = d.restart.qdrant_url;
     $('cfg-embedding_model').value = d.restart.embedding_model;
     $('cfg-embedding_dimensions').value = d.restart.embedding_dimensions;
@@ -697,6 +706,7 @@ $('config-save').onclick = async () => {
   body.extraction_model = $('cfg-extraction_model').value;
   if (Object.entries(body).some(([k, v]) => k !== 'generation_model' && k !== 'extraction_model' && typeof v === 'number' && Number.isNaN(v))) { toast('Fill every field with a valid number', 'err'); return; }
   body.gemini_api_keys = $('cfg-gemini_api_keys').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  body.gemini_api_keys_add = $('cfg-gemini_api_keys_add').value.split('\n').map((s) => s.trim()).filter(Boolean);
   body.thinking_level = $('cfg-thinking_level').value;
   // Restart-required fields: send "" when untouched so the server never sees
   // phantom changes (the phantom "restart required" bug).
@@ -707,6 +717,7 @@ $('config-save').onclick = async () => {
   try {
     const d = await apiJson('/api/config', { method: 'PUT', body: JSON.stringify(body) });
     if (d.restart_required) { toast('Saved. Some settings need a restart (Danger Zone tab).', 'ok'); $('restart-banner').classList.remove('hidden'); }
+    else if (d.keys_added != null) toast(`Saved — added ${d.keys_added} key(s), pool now ${d.keys_total}`, 'ok');
     else toast('Saved — applied instantly');
     loadConfig();
   } catch (e) { toast(e.message, 'err'); }

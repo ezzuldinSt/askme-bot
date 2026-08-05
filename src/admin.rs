@@ -511,6 +511,9 @@ struct ConfigUpdate {
     url_context_enabled: bool,
     // Hot-applied (empty/None = leave unchanged).
     gemini_api_keys: Option<Vec<String>>,
+    /// Appended to the current pool (deduped). Ignored when gemini_api_keys
+    /// (the wholesale replace) is non-empty — replace wins.
+    gemini_api_keys_add: Option<Vec<String>>,
     generation_model: Option<String>,
     /// Extraction model: empty = "same as chat model" (clears the override).
     extraction_model: Option<String>,
@@ -574,6 +577,20 @@ fn apply_restart_override_u64(slot: &mut Option<u64>, incoming: Option<u64>, env
         .and_then(|s| s.parse().ok())
         .unwrap_or(default);
     *slot = if v == fallback { None } else { Some(v) };
+}
+
+/// Merge `adds` into `pool`, skipping exact duplicates and preserving order.
+/// Returns the merged pool and how many keys were actually new.
+fn merge_api_keys(pool: &[String], adds: &[String]) -> (Vec<String>, usize) {
+    let mut pool = pool.to_vec();
+    let before = pool.len();
+    for k in adds {
+        if !pool.contains(k) {
+            pool.push(k.clone());
+        }
+    }
+    let added = pool.len() - before;
+    (pool, added)
 }
 
 async fn put_config(
@@ -641,6 +658,7 @@ async fn put_config(
     o.url_context_enabled = Some(req.url_context_enabled);
 
     // Key pool: empty/None = unchanged; otherwise replace wholesale (min 1).
+    // Replace wins over append when both are filled.
     let new_keys = match req.gemini_api_keys {
         Some(keys) => {
             let cleaned: Vec<String> = keys
@@ -658,6 +676,32 @@ async fn put_config(
             }
         }
         None => None,
+    };
+    // Append path: merge new keys into the current pool (deduped). The pool
+    // may live in env vars until the first panel edit — resolve materializes
+    // it into the file.
+    let mut keys_added: Option<(usize, usize)> = None; // (newly added, pool total)
+    let new_keys = match new_keys {
+        some @ Some(_) => some,
+        None => {
+            let adds: Vec<String> = req
+                .gemini_api_keys_add
+                .unwrap_or_default()
+                .iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            if adds.is_empty() {
+                None
+            } else {
+                if adds.iter().any(|k| k.chars().any(char::is_whitespace)) {
+                    return err(StatusCode::BAD_REQUEST, "API keys must not contain whitespace");
+                }
+                let (pool, added) = merge_api_keys(&config::resolve_gemini_keys(&o), &adds);
+                keys_added = Some((added, pool.len()));
+                Some(pool)
+            }
+        }
     };
     if let Some(keys) = &new_keys {
         o.gemini_api_keys = keys.clone();
@@ -775,7 +819,12 @@ async fn put_config(
         st.needs_restart.store(true, Ordering::Relaxed);
     }
     info!("Configuration updated via admin panel (restart_required={restart_changed})");
-    Ok(Json(json!({ "ok": true, "restart_required": restart_changed })))
+    Ok(Json(json!({
+        "ok": true,
+        "restart_required": restart_changed,
+        "keys_added": keys_added.map(|(a, _)| a),
+        "keys_total": keys_added.map(|(_, t)| t),
+    })))
 }
 
 // ── Support FAQs ──
@@ -981,6 +1030,26 @@ mod tests {
         assert_eq!(all.first().unwrap().seq, 101);
         let (page, _) = buf.since(all.last().unwrap().seq - 1);
         assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn merge_api_keys_appends_and_dedupes() {
+        let pool = vec!["k1".to_string(), "k2".to_string()];
+        let (merged, added) = merge_api_keys(&pool, &["k3".to_string()]);
+        assert_eq!(merged, vec!["k1", "k2", "k3"]);
+        assert_eq!(added, 1);
+        // Duplicates (exact string match) are skipped; order preserved.
+        let (merged, added) = merge_api_keys(&pool, &["k2".to_string(), "k4".to_string(), "k1".to_string()]);
+        assert_eq!(merged, vec!["k1", "k2", "k4"]);
+        assert_eq!(added, 1);
+        // Nothing new: pool untouched, count zero.
+        let (merged, added) = merge_api_keys(&pool, &["k1".to_string()]);
+        assert_eq!(merged, pool);
+        assert_eq!(added, 0);
+        // Empty pool (fresh install): all adds land.
+        let (merged, added) = merge_api_keys(&[], &["a".to_string(), "b".to_string()]);
+        assert_eq!(merged, vec!["a", "b"]);
+        assert_eq!(added, 2);
     }
 
     #[test]
