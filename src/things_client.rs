@@ -90,6 +90,20 @@ pub fn is_auth_expired(err: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<AuthExpired>().is_some())
 }
 
+/// True if the error chain holds a definitive HTTP 404 — for `GET /posts/{id}`
+/// that means the post is gone (deleted or otherwise inaccessible), never a
+/// transient failure. Retryable errors (5xx, 429, transport) never surface as
+/// `ClientRejected`, so they can never be mistaken for a deletion.
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<ClientRejected>()
+                .map(|r| r.status == StatusCode::NOT_FOUND)
+                .unwrap_or(false)
+        })
+}
+
 /// Raised on 4xx (non-401): the server validated and REJECTED the request,
 /// so nothing was committed. Callers can downcast to this to tell a
 /// definitive rejection (safe to retry with a corrected payload) apart from
@@ -733,6 +747,32 @@ mod tests {
         // 401 -> AuthExpired.
         let err: anyhow::Error = http_error(StatusCode::UNAUTHORIZED, "Reply error", b"").into();
         assert!(is_auth_expired(&err));
+    }
+
+    #[test]
+    fn is_not_found_only_matches_definitive_404() {
+        // 404 -> ClientRejected -> is_not_found.
+        let err: anyhow::Error = http_error(StatusCode::NOT_FOUND, "Get post error", b"").into();
+        assert!(is_not_found(&err));
+
+        // Other 4xx (403/422) are rejections but NOT deletions.
+        for status in [StatusCode::FORBIDDEN, StatusCode::UNPROCESSABLE_ENTITY] {
+            let err: anyhow::Error = http_error(status, "Get post error", b"").into();
+            assert!(!is_not_found(&err), "{status} must not look like a deletion");
+        }
+
+        // 5xx/429 are retryable — never a deletion signal.
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let err: anyhow::Error = http_error(status, "Get post error", b"").into();
+            assert!(!is_not_found(&err), "{status} is ambiguous — never a deletion");
+        }
+
+        // 401 is its own type, not a 404.
+        let err: anyhow::Error = http_error(StatusCode::UNAUTHORIZED, "Get post error", b"").into();
+        assert!(!is_not_found(&err));
     }
 
     #[test]

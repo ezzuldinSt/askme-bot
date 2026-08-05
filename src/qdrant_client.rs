@@ -779,6 +779,47 @@ impl QdrantClient {
         Ok(())
     }
 
+    /// Delete conversation messages by their Things post ids (the point ids of
+    /// the conversation collection). Used to forget posts that no longer exist
+    /// on Things.
+    pub async fn delete_conversation_points(&self, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let client = self.client()?;
+        client
+            .delete_points(
+                DeletePointsBuilder::new(self.collection.clone())
+                    .points(PointsIdsList {
+                        ids: ids.iter().map(|id| (*id).into()).collect(),
+                    })
+                    .wait(true),
+            )
+            .await
+            .context("Failed to delete conversation points from Qdrant")?;
+        Ok(())
+    }
+
+    /// List the `(id, parent_id)` of the most recent `max` conversation
+    /// messages, newest first. The deleted-post sweeper verifies each of these
+    /// against the Things API.
+    pub async fn list_conversation_refs(&self, max: u64) -> Result<Vec<(u64, Option<u64>)>> {
+        let client = self.client()?;
+        let points = self
+            .scroll_raw::<MemoryEntry>(
+                &client,
+                &self.collection.clone(),
+                Filter::default(),
+                Some(("timestamp", Direction::Desc)),
+                max,
+            )
+            .await?;
+        Ok(points
+            .into_iter()
+            .filter_map(|(_, p)| p.map(|e| (e.id, e.parent_id)))
+            .collect())
+    }
+
     /// Semantic search over ACTIVE app-knowledge facts, gated by `min_score` so
     /// unrelated questions never see app knowledge.
     pub async fn search_app_knowledge(

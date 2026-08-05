@@ -34,7 +34,7 @@ use crate::qdrant_models::{
     AppKnowledgeSeed, FactCategory, MemoryEntry, MessagePayload, MessageType, UserFactPayload,
     PROCESSED_COLLECTION_NAME, THINGS_KNOWLEDGE_COLLECTION_NAME, USER_PROFILES_COLLECTION_NAME,
 };
-use crate::things_client::{is_auth_expired, ClientRejected, ThingsClient, TOKEN_FILE};
+use crate::things_client::{is_auth_expired, is_not_found, ClientRejected, ThingsClient, TOKEN_FILE};
 use crate::tools::{
     tool_declarations, ExtractionJob, ExtractionSource, ExtractionTask, FlowMeter, FlowSubject,
     ToolContext,
@@ -56,6 +56,21 @@ const MAX_NOTIFICATION_PAGES: u32 = 5;
 const MAX_PROCESS_ATTEMPTS: u8 = 3;
 /// Polls with an unchanged unread count before a stuck count is called out.
 const STAGNANT_WARN_CYCLES: u32 = 20;
+/// Deleted-post sweep: runs this often after the boot sweep.
+const SWEEP_INTERVAL_SECS: u64 = 6 * 3600;
+/// Delay before the first sweep so a crash-looping service cannot hammer the
+/// Things API.
+const SWEEP_BOOT_DELAY_SECS: u64 = 60;
+/// Spacing between per-post existence checks during a sweep (keeps the
+/// request rate well under anything Cloudflare would frown at).
+const SWEEP_REQUEST_SPACING_MS: u64 = 200;
+/// Most recent conversation points verified per sweep.
+const SWEEP_MAX_POINTS: u64 = 2_000;
+/// A sweep only aborts on suspicion once at least this many posts were checked.
+const SWEEP_ABORT_MIN_CHECKED: usize = 50;
+/// ...and when more than this share of them 404 — mass 404s mean an API
+/// malfunction, not a mass deletion.
+const SWEEP_ABORT_STALE_RATIO: f64 = 0.9;
 /// Timeout for the final memory-writer flush on shutdown.
 const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 10;
 /// Curated Things-app knowledge seeded into tier-3 memory on every boot.
@@ -333,6 +348,14 @@ async fn main() -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             poll_loop(state).await;
+        });
+    }
+
+    // Forget posts that get deleted on Things (boot sweep + periodic sweeps).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            sweep_loop(state).await;
         });
     }
 
@@ -927,6 +950,95 @@ async fn poll_loop(state: Arc<RwLock<AppState>>) {
     }
 }
 
+/// Decide a sweep's fate from its hit counts. A run that finds nearly every
+/// stored post gone is far more likely an API malfunction than a mass
+/// deletion, so it refuses to delete anything.
+fn sweep_should_abort(checked: usize, stale: usize) -> bool {
+    checked >= SWEEP_ABORT_MIN_CHECKED
+        && (stale as f64) / (checked as f64) > SWEEP_ABORT_STALE_RATIO
+}
+
+/// Forget posts that no longer exist on Things: verify stored conversation
+/// messages against the API and purge the ones that 404.
+///
+/// Only a definitive 404 counts as deleted — any other failure (5xx, 429,
+/// 403, transport) leaves the point untouched — and an implausibly high
+/// stale ratio aborts the whole sweep instead of wiping memory on an API bug.
+async fn sweep_deleted_posts(state: &RwLock<AppState>) {
+    let (things, qdrant) = {
+        let s = state.read().await;
+        (s.things.clone(), s.qdrant.clone())
+    };
+    if !qdrant.is_available() {
+        return;
+    }
+    let refs = match qdrant.list_conversation_refs(SWEEP_MAX_POINTS).await {
+        Ok(refs) => refs,
+        Err(e) => {
+            warn!("Deleted-post sweep: failed to list conversation points: {e}");
+            return;
+        }
+    };
+    if refs.is_empty() {
+        return;
+    }
+
+    let mut stale: Vec<u64> = Vec::new();
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    for (id, _) in &refs {
+        match things.get_post(*id).await {
+            Ok(_) => {}
+            Err(e) => {
+                exit_if_auth_expired(&e);
+                if is_not_found(&e) {
+                    stale.push(*id);
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        checked += 1;
+        tokio::time::sleep(Duration::from_millis(SWEEP_REQUEST_SPACING_MS)).await;
+    }
+
+    if stale.is_empty() {
+        info!("Deleted-post sweep: {checked} checked, nothing stale ({skipped} skipped)");
+        return;
+    }
+    if sweep_should_abort(checked, stale.len()) {
+        warn!(
+            "Deleted-post sweep ABORTED: {} of {} checked posts 404 (>{:.0}%); \
+             that smells like an API malfunction, not a mass deletion — nothing purged",
+            stale.len(),
+            checked,
+            SWEEP_ABORT_STALE_RATIO * 100.0,
+        );
+        return;
+    }
+    match qdrant.delete_conversation_points(&stale).await {
+        Ok(()) => info!(
+            "Deleted-post sweep: {checked} checked, {} stale purged, {skipped} skipped",
+            stale.len(),
+        ),
+        Err(e) => error!(
+            "Deleted-post sweep: failed to purge {} stale points: {e}",
+            stale.len()
+        ),
+    }
+}
+
+/// Periodic reconciliation: Things posts are ephemeral and users delete
+/// replies, but Qdrant memory would otherwise keep echoing them into
+/// conversation context forever.
+async fn sweep_loop(state: Arc<RwLock<AppState>>) {
+    tokio::time::sleep(Duration::from_secs(SWEEP_BOOT_DELAY_SECS)).await;
+    loop {
+        sweep_deleted_posts(&state).await;
+        tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+    }
+}
+
 fn is_mention_notification(notification: &Notification) -> bool {
     let nt = notification.notification_type.as_deref().unwrap_or("");
     let group = notification.group.as_deref().unwrap_or("");
@@ -1066,15 +1178,31 @@ async fn process_notification(
         }
     };
 
-    let post_data = {
+    // The read guard must drop before the error path: the 404 branch below
+    // takes further locks (and `skip_notification` a write lock).
+    let post_data_result = {
         let things = &state.read().await.things;
-        match things.get_post(post_id).await {
-            Ok(data) => data,
-            Err(e) => {
-                exit_if_auth_expired(&e);
-                error!("Failed to fetch post {post_id}: {e}");
-                return ProcessOutcome::Failed;
+        things.get_post(post_id).await
+    };
+
+    let post_data = match post_data_result {
+        Ok(data) => data,
+        Err(e) => {
+            exit_if_auth_expired(&e);
+            if is_not_found(&e) {
+                // The post was deleted between notification and processing —
+                // retrying can never succeed, so skip instead of failing.
+                info!("Notification {notification_id}: post {post_id} is gone (404), skipping");
+                let qdrant = state.read().await.qdrant.clone();
+                if qdrant.is_available() {
+                    if let Err(e) = qdrant.delete_conversation_points(&[post_id]).await {
+                        warn!("Failed to purge deleted post {post_id} from Qdrant: {e}");
+                    }
+                }
+                return skip_notification(&state, notification_id).await;
             }
+            error!("Failed to fetch post {post_id}: {e}");
+            return ProcessOutcome::Failed;
         }
     };
 
@@ -3060,6 +3188,21 @@ fn call_cache_key(name: &str, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_abort_valve_boundaries() {
+        // Nothing checked yet / tiny samples never abort.
+        assert!(!sweep_should_abort(0, 0));
+        assert!(!sweep_should_abort(SWEEP_ABORT_MIN_CHECKED - 1, SWEEP_ABORT_MIN_CHECKED - 1));
+        // Exactly at the ratio is still allowed (abort is strictly above).
+        assert!(!sweep_should_abort(100, 90));
+        // Clearly suspicious: almost everything 404 -> refuse to purge.
+        assert!(sweep_should_abort(100, 91));
+        assert!(sweep_should_abort(SWEEP_ABORT_MIN_CHECKED, SWEEP_ABORT_MIN_CHECKED));
+        // Healthy mixes never abort.
+        assert!(!sweep_should_abort(397, 226));
+        assert!(!sweep_should_abort(2000, 0));
+    }
 
     #[test]
     fn strip_mention_basic() {
