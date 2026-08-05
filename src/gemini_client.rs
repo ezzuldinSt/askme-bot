@@ -95,6 +95,19 @@ pub enum GeminiError {
     Failed(anyhow::Error),
 }
 
+/// Transient errors (5xx/transport) outlasted every in-client retry budget.
+/// Typed so callers — e.g. the fact-extraction worker — can tell "try again
+/// later" apart from a genuinely broken request.
+#[derive(Debug, thiserror::Error)]
+#[error("transient Gemini errors exhausted all retries: {0}")]
+pub struct TransientExhausted(anyhow::Error);
+
+/// True if the error (or anything in its chain) is a `TransientExhausted`.
+pub fn is_transient_exhausted(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<TransientExhausted>().is_some())
+}
+
 /// A function call requested by the model during a tool-calling turn. The
 /// thought signature and call id live in `GenerateTurn::raw_parts` and are
 /// circulated verbatim; this struct only drives execution.
@@ -570,7 +583,7 @@ impl GeminiClient {
                 Err(AttemptFailure::Transient(e)) => {
                     transient_retries += 1;
                     if transient_retries >= GENERATE_MAX_ATTEMPTS {
-                        return Err(e);
+                        return Err(TransientExhausted(e).into());
                     }
                     warn!("Gemini transient error (retry {transient_retries}): {e}");
                     sleep(backoff(transient_retries)).await;
@@ -1644,6 +1657,17 @@ mod tests {
     fn daily_cooldown_is_bounded() {
         let d = daily_cooldown_duration();
         assert!(d > Duration::ZERO && d <= Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn transient_exhausted_is_downcastable_through_chain() {
+        let inner = anyhow::anyhow!("Gemini API error (HTTP 503 Service Unavailable)");
+        let err: anyhow::Error = TransientExhausted(inner).into();
+        let wrapped = err.context("generate_json failed");
+        assert!(is_transient_exhausted(&wrapped));
+
+        let plain = anyhow::anyhow!("Gemini API error (HTTP 400 Bad Request)");
+        assert!(!is_transient_exhausted(&plain));
     }
 
     #[test]

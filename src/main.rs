@@ -24,7 +24,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::RuntimeConfig;
 use crate::entities::build_reply_with_entities;
-use crate::gemini_client::{GeminiClient, GeminiError, GenerateTurn, KeyLease};
+use crate::gemini_client::{
+    is_transient_exhausted, GeminiClient, GeminiError, GenerateTurn, KeyLease,
+};
 use crate::models::{
     Content, FileData, FunctionResponseData, Notification, Part, Post,
 };
@@ -1142,23 +1144,45 @@ async fn skip_notification(state: &Arc<RwLock<AppState>>, notification_id: u64) 
     ProcessOutcome::Skipped
 }
 
-/// Whether a failed reply-post is safe to retry. Retrying is only safe when
-/// the reply definitely never committed server-side: connect errors (the
-/// request never reached the server) and 4xx `ClientRejected` (the server
-/// validated and REJECTED the payload). Anything else (timeout after send,
-/// 5xx) is ambiguous — the reply may have been committed, and retrying would
-/// post a duplicate, which is worse than a lost retry.
-fn reply_error_is_safe_to_retry(e: &anyhow::Error) -> bool {
+/// How a failed reply-post should be handled.
+enum ReplyFailure {
+    /// The reply definitely never committed AND a later attempt may succeed:
+    /// connect errors (the request never reached the server) and 422
+    /// validation rejections (the text is regenerated on every attempt).
+    Retryable,
+    /// The server definitively refused this TARGET (403 replies-disabled /
+    /// forbidden, 404/410 gone, 400 or other 4xx payload problems a
+    /// regenerated text won't fix). Retrying only burns Gemini quota.
+    Permanent,
+    /// Ambiguous (timeout after send, 5xx): the reply may have committed —
+    /// retrying would post a duplicate, which is worse than a lost retry.
+    Ambiguous,
+}
+
+/// Classify a failed reply-post. The old binary "safe to retry" treated every
+/// 4xx as retryable, so a replies-disabled post (403) re-ran the ENTIRE
+/// pipeline — fetch, embed, generate — three pointless times.
+fn classify_reply_error(e: &anyhow::Error) -> ReplyFailure {
+    let rejected_status = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ClientRejected>().map(|r| r.status));
+    if let Some(status) = rejected_status {
+        return match status {
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY => ReplyFailure::Retryable,
+            _ => ReplyFailure::Permanent,
+        };
+    }
     let never_sent = e.chain().any(|cause| {
         cause
             .downcast_ref::<reqwest::Error>()
             .map(|re| re.is_connect())
             .unwrap_or(false)
     });
-    let rejected = e
-        .chain()
-        .any(|cause| cause.downcast_ref::<ClientRejected>().is_some());
-    never_sent || rejected
+    if never_sent {
+        ReplyFailure::Retryable
+    } else {
+        ReplyFailure::Ambiguous
+    }
 }
 
 async fn process_notification(
@@ -1256,7 +1280,20 @@ async fn process_notification(
     {
         let qdrant = state.read().await.qdrant.clone();
         // Empty mentions carry no content worth remembering; skip the store.
-        if qdrant.is_available() && !is_empty_mention {
+        // A retry re-processing the same notification finds the post already
+        // stored with identical content — skip the re-store too: an upsert
+        // would re-embed the identical text and burn an API call for nothing.
+        let mut should_store = qdrant.is_available() && !is_empty_mention;
+        if should_store {
+            match qdrant.get_point(post_id).await {
+                Ok(Some(existing)) if existing.content == memory_payload.content => {
+                    should_store = false;
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Failed to check stored copy of post {post_id}: {e}"),
+            }
+        }
+        if should_store {
             if is_follow_up {
                 // Follow-ups must be immediately visible to the context builder.
                 if let Err(e) = qdrant.upsert(&memory_payload).await {
@@ -1388,14 +1425,33 @@ async fn process_notification(
         Err(e) => {
             exit_if_auth_expired(&e);
             error!("Failed to post reply to {post_id}: {e}");
-            if reply_error_is_safe_to_retry(&e) {
-                return ProcessOutcome::Failed;
+            match classify_reply_error(&e) {
+                ReplyFailure::Retryable => return ProcessOutcome::Failed,
+                ReplyFailure::Permanent => {
+                    warn!(
+                        "Reply target {post_id} permanently rejected the reply; \
+                         skipping notification {notification_id} (no quota-wasting retries)"
+                    );
+                    // A 404 at reply time means the post was deleted mid-flow:
+                    // forget it right away instead of waiting for the sweeper.
+                    if is_not_found(&e) {
+                        let qdrant = state.read().await.qdrant.clone();
+                        if qdrant.is_available() {
+                            if let Err(e) = qdrant.delete_conversation_points(&[post_id]).await {
+                                warn!("Failed to purge deleted post {post_id} from Qdrant: {e}");
+                            }
+                        }
+                    }
+                    return skip_notification(&state, notification_id).await;
+                }
+                ReplyFailure::Ambiguous => {
+                    warn!(
+                        "Not retrying reply for notification {notification_id} \
+                         (reply may already be committed); marking processed"
+                    );
+                    return skip_notification(&state, notification_id).await;
+                }
             }
-            warn!(
-                "Not retrying reply for notification {notification_id} \
-                 (reply may already be committed); marking processed"
-            );
-            return skip_notification(&state, notification_id).await;
         }
     };
 
@@ -2165,14 +2221,35 @@ async fn run_extraction_job(
         return;
     }
 
-    if let Some(m) = meter {
-        m.gen();
-    }
-    let extracted = match gemini.extract_facts(&job.username, &job.text).await {
-        Ok(e) => e,
-        Err(e) => {
-            warn!("Fact extraction failed for post {}: {e}", job.post_id);
-            return;
+    // Transient Gemini trouble (503 demand spikes) exhausts the in-client
+    // retries and surfaces as TransientExhausted; give those a few spaced-out
+    // extra attempts here instead of silently losing the facts. Anything else
+    // is a genuinely broken request — fail the job immediately.
+    const EXTRACTION_TRANSIENT_RETRIES: u32 = 2; // 3 attempts total
+    let mut transient_attempt = 0u32;
+    let extracted = loop {
+        if let Some(m) = meter {
+            m.gen();
+        }
+        match gemini.extract_facts(&job.username, &job.text).await {
+            Ok(e) => break e,
+            Err(e) => {
+                if is_transient_exhausted(&e) && transient_attempt < EXTRACTION_TRANSIENT_RETRIES {
+                    transient_attempt += 1;
+                    // 30s, then 120s.
+                    let wait = Duration::from_secs(30 * 4u64.pow(transient_attempt - 1));
+                    warn!(
+                        "Fact extraction for post {} hit transient Gemini trouble; \
+                         retry {transient_attempt}/{EXTRACTION_TRANSIENT_RETRIES} in {}s",
+                        job.post_id,
+                        wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                warn!("Fact extraction failed for post {}: {e}", job.post_id);
+                return;
+            }
         }
     };
     let now = unix_now();
@@ -3250,18 +3327,41 @@ mod tests {
     }
 
     #[test]
-    fn reply_error_safe_to_retry_when_server_rejected() {
-        // 4xx: the server validated and REJECTED the payload — nothing was
-        // committed, so the notification should be retried, not poison-marked.
+    fn reply_error_422_stays_retryable() {
+        // 422: the server validated and REJECTED the payload — nothing was
+        // committed, and the text is regenerated on every attempt, so the
+        // notification should be retried, not poison-marked.
         let err = anyhow::Error::new(ClientRejected {
             status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
             context: "Reply error".to_string(),
             body: "comment too long".to_string(),
         });
-        assert!(reply_error_is_safe_to_retry(&err));
+        assert!(matches!(classify_reply_error(&err), ReplyFailure::Retryable));
         // Still detected when wrapped in context layers.
         let err = err.context("posting reply failed");
-        assert!(reply_error_is_safe_to_retry(&err));
+        assert!(matches!(classify_reply_error(&err), ReplyFailure::Retryable));
+    }
+
+    #[test]
+    fn reply_error_other_4xx_is_permanent() {
+        // 403/404/400: the target definitively refused — retrying re-runs the
+        // whole generate pipeline for nothing.
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::GONE,
+        ] {
+            let err = anyhow::Error::new(ClientRejected {
+                status,
+                context: "Reply error".to_string(),
+                body: String::new(),
+            });
+            assert!(
+                matches!(classify_reply_error(&err), ReplyFailure::Permanent),
+                "{status} must be permanent"
+            );
+        }
     }
 
     #[test]
@@ -3269,7 +3369,7 @@ mod tests {
         // 5xx/timeout-style failures may have committed server-side — retrying
         // would risk a duplicate reply.
         let err = anyhow::anyhow!("Reply error (HTTP 500): Internal Server Error");
-        assert!(!reply_error_is_safe_to_retry(&err));
+        assert!(matches!(classify_reply_error(&err), ReplyFailure::Ambiguous));
     }
 
     #[test]

@@ -167,6 +167,11 @@ pub struct ToolContext {
     pub flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
     /// Per-flow API call counters (shared with the reply flow itself).
     pub meter: Arc<FlowMeter>,
+    /// Per-flow memo of tool results keyed by (name, canonical args). The
+    /// model sometimes re-issues an identical call within one flow; answering
+    /// from cache is instant and stops mid-flow state changes (e.g. a fact
+    /// learned between rounds) from provoking re-query loops.
+    cache: Arc<Mutex<std::collections::HashMap<String, Value>>>,
 }
 
 impl ToolContext {
@@ -185,6 +190,7 @@ impl ToolContext {
             extraction_tx,
             flow_subjects,
             meter,
+            cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -202,7 +208,18 @@ impl ToolContext {
 
     /// Execute one requested tool call and return the JSON result the model
     /// should see. Unknown tools and handler failures become `{"error": ...}`.
+    ///
+    /// Identical calls within one flow are answered from the per-flow cache —
+    /// except `get_current_time` (its whole point is to change) and error
+    /// results (a retry may legitimately succeed).
     pub async fn execute(&self, name: &str, args: &Value) -> Value {
+        let cache_key = (name != "get_current_time").then(|| tool_cache_key(name, args));
+        if let Some(key) = &cache_key {
+            let hit = self.cache.lock().unwrap().get(key).cloned();
+            if let Some(hit) = hit {
+                return hit;
+            }
+        }
         let result = match name {
             "web_search" => self.web_search(args).await,
             "web_fetch" => self.web_fetch(args).await,
@@ -219,6 +236,11 @@ impl ToolContext {
                 json!({ "error": format!("unknown tool: {other}") })
             }
         };
+        if let Some(key) = cache_key {
+            if result.get("error").is_none() {
+                self.cache.lock().unwrap().insert(key, result.clone());
+            }
+        }
         self.observe_subject(name, args, &result);
         result
     }
@@ -905,6 +927,36 @@ fn arg_u64(args: &Value, name: &str) -> Option<u64> {
     args.get(name).and_then(|v| v.as_u64())
 }
 
+/// Stable cache key for a tool call: object keys are sorted recursively so
+/// semantically identical args hit the same slot regardless of key order.
+fn tool_cache_key(name: &str, args: &Value) -> String {
+    fn canon(v: &Value) -> String {
+        match v {
+            Value::Object(map) => {
+                let mut pairs: Vec<_> = map.iter().collect();
+                pairs.sort_by_key(|(a, _)| *a);
+                let inner: Vec<String> = pairs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(k).unwrap_or_default(),
+                            canon(v)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            Value::Array(items) => format!(
+                "[{}]",
+                items.iter().map(canon).collect::<Vec<_>>().join(",")
+            ),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        }
+    }
+    format!("{name}:{}", canon(args))
+}
+
 fn err(message: impl Into<String>) -> Value {
     json!({ "error": message.into() })
 }
@@ -1240,6 +1292,26 @@ mod tests {
         assert_eq!(title, "t");
         assert!(!text.contains("hidden"));
         assert!(text.contains('a') && text.contains('b'));
+    }
+
+    #[test]
+    fn tool_cache_key_is_order_insensitive() {
+        let a = json!({"query": "hackr", "limit": 3, "nested": {"x": 1, "y": [2, 3]}});
+        let b = json!({"nested": {"y": [2, 3], "x": 1}, "limit": 3, "query": "hackr"});
+        assert_eq!(
+            tool_cache_key("search_users", &a),
+            tool_cache_key("search_users", &b)
+        );
+        // Different tool or different args -> different slot.
+        assert_ne!(
+            tool_cache_key("search_users", &a),
+            tool_cache_key("get_user_facts", &a)
+        );
+        let c = json!({"query": "someone else"});
+        assert_ne!(
+            tool_cache_key("search_users", &a),
+            tool_cache_key("search_users", &c)
+        );
     }
 
     #[test]
