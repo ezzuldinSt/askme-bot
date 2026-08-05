@@ -1655,8 +1655,48 @@ fn extract_media_urls(post: &Post) -> Vec<String> {
             }
         }
     }
+    // Music attachments (Apple Music cards): the playable audio is the
+    // preview URL (~30s AAC on Apple's public CDN).
+    if let Some(ref music) = post.music {
+        for item in music {
+            if let Some(ref url) = item.preview_url {
+                push(url);
+            }
+        }
+    }
 
     urls
+}
+
+/// A short "[Attached music: ...]" prompt line naming the post's tracks, so
+/// the model can discuss the song even when the audio upload fails or the
+/// track has no preview. PROMPT-ONLY: never stored in memory or fed to fact
+/// extraction (it lives outside `content_text()`/`extract_question`).
+fn music_note(post: &Post) -> String {
+    let tracks: Vec<String> = post
+        .music
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|m| {
+                    let title = m.title.as_deref().unwrap_or("").trim();
+                    let artist = m.artist.as_deref().unwrap_or("").trim();
+                    match (title.is_empty(), artist.is_empty()) {
+                        (true, true) => None,
+                        (false, true) => Some(format!("\"{title}\"")),
+                        (true, false) => Some(artist.to_string()),
+                        (false, false) => Some(format!("\"{title}\" — {artist}")),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if tracks.is_empty() {
+        String::new()
+    } else {
+        format!("\n[Attached music: {}]", tracks.join(", "))
+    }
 }
 
 async fn build_mention_prompt(
@@ -1678,10 +1718,11 @@ async fn build_mention_prompt(
     let app_knowledge = build_app_knowledge_section(state, question, meter).await;
 
     format!(
-        "[Post by {author}] {content}\n[Question] {question}{above}{profile}{app_knowledge}",
+        "[Post by {author}] {content}\n[Question] {question}{music}{above}{profile}{app_knowledge}",
         content = post.content_text(),
         question = question,
         author = author,
+        music = music_note(post),
         above = above,
         profile = profile,
         app_knowledge = app_knowledge,
@@ -1738,7 +1779,7 @@ async fn build_greeting_prompt(
         } else {
             ""
         },
-    ) + &context
+    ) + &music_note(post) + &context
 }
 
 /// Render the thread above a mention as prompt context, oldest first (the same
@@ -1926,9 +1967,10 @@ async fn build_follow_up_prompt(
     let app_knowledge = build_app_knowledge_section(state, question, meter).await;
 
     format!(
-        "[Follow-up question by {author}] {question}{context}{profile}{app_knowledge}",
+        "[Follow-up question by {author}] {question}{music}{context}{profile}{app_knowledge}",
         author = author,
         question = question,
+        music = music_note(post),
         context = context,
         profile = profile,
         app_knowledge = app_knowledge,
@@ -2542,6 +2584,7 @@ fn flow_attempt_cap(pool_size: usize, configured: usize) -> usize {
 /// scaffold text instead of answering — that must never be posted verbatim.
 const SCAFFOLD_LEAK_MARKERS: &[&str] = &[
     "[About ",
+    "[Attached music",
     "[Briefing for",
     "[Conversation so far]",
     "[Conversation above]",
@@ -2620,9 +2663,21 @@ async fn download_media_file(state: &RwLock<AppState>, url: &str) -> Result<Down
     };
     Ok(DownloadedMedia {
         data,
-        mime,
+        mime: normalize_audio_mime(&mime),
         display_name: format!("media_{}", uuid::Uuid::new_v4()),
     })
+}
+
+/// Gemini's documented audio MIME list has `audio/aac` but not the m4a/mp4
+/// aliases Apple's preview CDN serves for music attachments — normalize so
+/// the Files API doesn't reject the upload. Anything else passes through.
+fn normalize_audio_mime(mime: &str) -> String {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    match base.to_ascii_lowercase().as_str() {
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" | "audio/x-m4p" | "audio/m4p"
+        | "audio/mp4a-latm" => "audio/aac".to_string(),
+        _ => mime.to_string(),
+    }
 }
 
 /// How one tool-calling reply flow ended.
@@ -3568,6 +3623,7 @@ mod tests {
             post_comment: None,
             media: None,
             audio: None,
+            music: None,
             post_type: None,
             created_at: None,
             expires_at: None,
@@ -4016,5 +4072,96 @@ mod tests {
         );
         post.audio = Some(json!({ "unrelated": true }));
         assert!(extract_media_urls(&post).is_empty());
+    }
+
+    /// Music attachments (Apple Music cards): the preview URL is extracted as
+    /// playable audio, and the metadata note names the track for the prompt.
+    #[test]
+    fn extract_media_urls_includes_music_previews() {
+        let mut post = post_with_id(1);
+        post.music = Some(vec![crate::models::MusicItem {
+            id: Some(10925),
+            title: Some("جدة غير".to_string()),
+            artist: Some("Mooody محمود السفياني".to_string()),
+            album_name: Some("جدة غير - Single".to_string()),
+            artwork_url: Some("https://is1-ssl.mzstatic.com/artwork.jpg".to_string()),
+            preview_url: Some(
+                "https://audio-ssl.itunes.apple.com/itunes-assets/preview.m4a".to_string(),
+            ),
+        }]);
+        assert_eq!(
+            extract_media_urls(&post),
+            vec!["https://audio-ssl.itunes.apple.com/itunes-assets/preview.m4a".to_string()]
+        );
+        assert_eq!(
+            music_note(&post),
+            "\n[Attached music: \"جدة غير\" — Mooody محمود السفياني]"
+        );
+
+        // A track without a preview URL yields no media but still gets the note.
+        post.music = Some(vec![crate::models::MusicItem {
+            id: None,
+            title: Some("Song".to_string()),
+            artist: Some("Artist".to_string()),
+            album_name: None,
+            artwork_url: None,
+            preview_url: None,
+        }]);
+        assert!(extract_media_urls(&post).is_empty());
+        assert_eq!(music_note(&post), "\n[Attached music: \"Song\" — Artist]");
+
+        // No music at all -> no note.
+        post.music = None;
+        assert_eq!(music_note(&post), "");
+    }
+
+    /// Apple serves previews as audio/mp4 (or x-m4a) — Gemini's documented
+    /// list only takes audio/aac, so uploads are normalized.
+    #[test]
+    fn normalize_audio_mime_maps_m4a_aliases_to_aac() {
+        assert_eq!(normalize_audio_mime("audio/mp4"), "audio/aac");
+        assert_eq!(normalize_audio_mime("audio/x-m4a"), "audio/aac");
+        assert_eq!(normalize_audio_mime("audio/x-m4p"), "audio/aac");
+        assert_eq!(normalize_audio_mime("audio/m4p"), "audio/aac");
+        assert_eq!(normalize_audio_mime("audio/mp4a-latm"), "audio/aac");
+        assert_eq!(normalize_audio_mime("audio/mp4; codecs=mp4a.40.2"), "audio/aac");
+        // Everything else passes through untouched.
+        assert_eq!(normalize_audio_mime("audio/ogg"), "audio/ogg");
+        assert_eq!(normalize_audio_mime("image/jpeg"), "image/jpeg");
+        assert_eq!(normalize_audio_mime("video/mp4"), "video/mp4");
+    }
+
+    /// Fixture test with a real Things payload (CR7's music post, 5757646):
+    /// guards against field-name drift in the music card shape.
+    #[test]
+    fn parses_real_music_post_payload() {
+        let raw = r#"{"data":{"post":{"id":5757646,"user":{"id":14348,"username":"CR7"},
+            "parent_id":null,"post_comment":"مين زيي لا اخاف من المجتمع وحابتها مره وانطرب عليها",
+            "entities":[],"media":[],"audio":null,
+            "music":[{"id":10925,"title":"جدة غير","artist":"Mooody محمود السفياني",
+                      "albumName":"جدة غير - Single",
+                      "artworkURL":"https://is1-ssl.mzstatic.com/image/thumb/artwork.jpg",
+                      "previewURL":"https://audio-ssl.itunes.apple.com/itunes-assets/mzaf_15182545737609936747.plus.aac.p.m4a"}],
+            "created_at":"2026-08-05T16:23:09.000000Z","post_type":"b",
+            "expires_at":"2026-08-07T16:23:09.000000Z"},"parent":null,"quoted":null}}"#;
+        let envelope: crate::models::PostEnvelope = serde_json::from_str(raw).unwrap();
+        let post = envelope.data.and_then(|d| d.post).expect("post parses");
+        assert_eq!(post.id_value(), Some(5757646));
+        assert_eq!(post.author_username(), "CR7");
+        let urls = extract_media_urls(&post);
+        assert_eq!(urls.len(), 1, "one music preview extracted");
+        assert!(urls[0].starts_with("https://audio-ssl.itunes.apple.com/"));
+        assert!(urls[0].ends_with(".m4a"));
+        assert_eq!(
+            music_note(&post),
+            "\n[Attached music: \"جدة غير\" — Mooody محمود السفياني]"
+        );
+    }
+
+    /// The music scaffold label must trip the leak guard like every other
+    /// injected section header.
+    #[test]
+    fn scaffold_leak_detection_includes_music_note() {
+        assert!(scaffold_leak_at("جواب\n[Attached music: \"x\" — y]").is_some());
     }
 }

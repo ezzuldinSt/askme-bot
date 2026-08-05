@@ -155,6 +155,9 @@ pub struct Post {
     pub post_comment: Option<String>,
     pub media: Option<Vec<MediaItem>>,
     pub audio: Option<serde_json::Value>,
+    /// Music shared on the post (Apple Music card). The audio lives at
+    /// `preview_url` (a ~30s AAC preview on Apple's public CDN).
+    pub music: Option<Vec<MusicItem>>,
     pub post_type: Option<String>,
     pub created_at: Option<String>,
     pub expires_at: Option<String>,
@@ -203,6 +206,22 @@ pub struct MediaItem {
     #[serde(rename = "type")]
     pub media_type: Option<String>,
     pub mime_type: Option<String>,
+}
+
+/// One music track attached to a post (Things sends an Apple Music card).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MusicItem {
+    pub id: Option<u64>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    #[serde(rename = "albumName")]
+    pub album_name: Option<String>,
+    #[serde(rename = "artworkURL")]
+    pub artwork_url: Option<String>,
+    /// ~30s AAC preview on Apple's public CDN (audio-ssl.itunes.apple.com) —
+    /// no auth needed, downloadable like any other media URL.
+    #[serde(rename = "previewURL")]
+    pub preview_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
