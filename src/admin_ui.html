@@ -342,6 +342,14 @@
               <option value="medium">medium</option>
               <option value="high">high</option>
             </select></div>
+          <div class="field"><label>Extraction thinking <span class="hint">reasoning for fact extraction / FAQ / rewrites — low is plenty (Thinking docs)</span></label>
+            <select id="cfg-extraction_thinking_level">
+              <option value="default">Default (low)</option>
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select></div>
         </div>
       </div>
 
@@ -676,6 +684,7 @@ async function loadConfig() {
     $('cfg-tools_enabled').checked = d.hot.tools.enabled;
     $('cfg-url_context_enabled').checked = d.hot.tools.url_context_enabled;
     $('cfg-thinking_level').value = d.hot.thinking_level ?? 'default';
+    $('cfg-extraction_thinking_level').value = d.hot.extraction_thinking_level || 'default';
     $('cfg-gemini_api_keys').value = '';
     $('cfg-gemini_api_keys_add').value = '';
     $('cfg-keys-current').textContent = d.restart.gemini_keys_masked.length
@@ -708,6 +717,7 @@ $('config-save').onclick = async () => {
   body.gemini_api_keys = $('cfg-gemini_api_keys').value.split('\n').map((s) => s.trim()).filter(Boolean);
   body.gemini_api_keys_add = $('cfg-gemini_api_keys_add').value.split('\n').map((s) => s.trim()).filter(Boolean);
   body.thinking_level = $('cfg-thinking_level').value;
+  body.extraction_thinking_level = $('cfg-extraction_thinking_level').value;
   // Restart-required fields: send "" when untouched so the server never sees
   // phantom changes (the phantom "restart required" bug).
   body.qdrant_url = $('cfg-qdrant_url').value === restartSnapshot.qdrant_url ? '' : $('cfg-qdrant_url').value;

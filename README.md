@@ -172,6 +172,8 @@ Reliability notes:
 | `USER_FACTS_LIMIT`              | `8`                        | Max user facts injected into a prompt.                 |
 | `GENERATION_MODEL`              | `gemini-3.6-flash`         | Chat model for replies (hot-reloadable via panel).     |
 | `THINKING_LEVEL`                | — (model default)          | `minimal`/`low`/`medium`/`high` (hot via panel).       |
+| `EXTRACTION_THINKING_LEVEL`     | `low`                      | Thinking level for extraction/FAQ/rewrite (hot via panel). |
+| `MEDIA_RESOLUTION`              | — (model default)          | `low`/`medium`/`high` media token budget (restart).    |
 | `USER_FACT_SUPERSEDE_THRESHOLD` | `0.78`                     | Similarity at which a new fact supersedes an old one.  |
 | `FORGET_SIMILARITY_THRESHOLD`   | `0.75`                     | Similarity for locating facts a user asked to forget.  |
 | `APP_KNOWLEDGE_LIMIT`           | `3`                        | Max app-knowledge facts injected into a prompt.        |

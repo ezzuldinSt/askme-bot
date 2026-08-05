@@ -386,6 +386,7 @@ async fn status(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Value>>
             "generation_model": gemini.generation_model(),
             "extraction_model": gemini.extraction_model(),
             "thinking_level": gemini.thinking_level(),
+            "extraction_thinking_level": gemini.extraction_thinking_level(),
             "user_facts_limit": runtime.memory.user_facts_limit,
             "app_knowledge_limit": runtime.memory.app_knowledge_limit,
             "app_knowledge_min_score": runtime.memory.app_knowledge_min_score,
@@ -448,6 +449,11 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "extraction_model_effective": config::resolve_extraction_model(o)
                 .unwrap_or_else(|| config::resolve_generation_model(o)),
             "thinking_level": config::resolve_thinking_level(o),
+            // Raw override ("" when unset) for the form + the effective value
+            // for display: unset means the built-in default ("low").
+            "extraction_thinking_level": o.extraction_thinking_level.clone().unwrap_or_default(),
+            "extraction_thinking_level_effective": config::resolve_extraction_thinking_level(o)
+                .unwrap_or_default(),
             "tools": {
                 "enabled": resolved.tools.enabled,
                 "max_rounds": resolved.tools.max_rounds,
@@ -519,6 +525,9 @@ struct ConfigUpdate {
     extraction_model: Option<String>,
     /// "default" or one of THINKING_LEVELS (empty/None = leave unchanged).
     thinking_level: Option<String>,
+    /// "default" clears the override (back to the built-in "low"); one of
+    /// THINKING_LEVELS sets it (empty/None = leave unchanged).
+    extraction_thinking_level: Option<String>,
     // Restart-required (empty/None = leave unchanged).
     qdrant_url: Option<String>,
     embedding_model: Option<String>,
@@ -761,6 +770,26 @@ async fn put_config(
         None => None,
     };
 
+    // Extraction thinking level: "default" clears the override (back to the
+    // built-in "low"); one of THINKING_LEVELS sets it. Hot-applied.
+    let new_extraction_thinking_level = match req.extraction_thinking_level {
+        Some(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                match parse_thinking_level(raw) {
+                    Ok(level) => {
+                        o.extraction_thinking_level = level.clone();
+                        Some(level)
+                    }
+                    Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
+                }
+            }
+        }
+        None => None,
+    };
+
     if let Some(u) = req.qdrant_url.as_ref().filter(|s| !s.trim().is_empty()) {
         if !u.trim().starts_with("http") {
             return err(StatusCode::BAD_REQUEST, "qdrant_url must start with http");
@@ -814,6 +843,9 @@ async fn put_config(
     }
     if let Some(level) = new_thinking_level {
         gemini.set_thinking_level(level);
+    }
+    if let Some(level) = new_extraction_thinking_level {
+        gemini.set_extraction_thinking_level(level);
     }
     if restart_changed {
         st.needs_restart.store(true, Ordering::Relaxed);

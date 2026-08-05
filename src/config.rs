@@ -35,6 +35,10 @@ pub const DEFAULT_EMBEDDING_DIMENSIONS: u32 = 512;
 pub const DEFAULT_QDRANT_URL: &str = "http://localhost:6334";
 /// Valid Gemini 3.x thinking levels (None = let the model use its own default).
 pub const THINKING_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
+/// Default thinking level for extraction/FAQ/rewrite jobs. The Thinking docs
+/// recommend minimal/low for fact retrieval and classification — the chat
+/// model's own default (medium) is wasted on these mechanical calls.
+pub const DEFAULT_EXTRACTION_THINKING_LEVEL: &str = "low";
 /// The embedding model used before DEFAULT_EMBEDDING_MODEL became the default;
 /// a missing migration marker is assumed to mean vectors of this model.
 pub const LEGACY_EMBEDDING_MODEL: &str = "gemini-embedding-001";
@@ -144,6 +148,9 @@ pub struct ConfigOverrides {
     /// Gemini 3.x thinking level: "minimal"|"low"|"medium"|"high", or None for
     /// the model's own default (hot-applied, no restart needed).
     pub thinking_level: Option<String>,
+    /// Thinking level for extraction/FAQ/rewrite jobs (hot-applied). None =
+    /// fall through to env, then DEFAULT_EXTRACTION_THINKING_LEVEL.
+    pub extraction_thinking_level: Option<String>,
     // Restart-required (clients built at boot).
     /// Legacy single-key field, kept for backward compatibility with older
     /// config files; folded into `gemini_api_keys` on load/save.
@@ -172,6 +179,47 @@ pub fn resolve_thinking_level(overrides: &ConfigOverrides) -> Option<String> {
         .as_ref()
         .and_then(valid)
         .or_else(|| std::env::var("THINKING_LEVEL").ok().as_ref().and_then(valid))
+}
+
+/// override > env `EXTRACTION_THINKING_LEVEL` > DEFAULT_EXTRACTION_THINKING_LEVEL.
+/// Invalid values are ignored rather than propagated into requests. Always
+/// Some under normal operation (the built-in default is "low").
+pub fn resolve_extraction_thinking_level(overrides: &ConfigOverrides) -> Option<String> {
+    let valid = |s: &String| THINKING_LEVELS.contains(&s.trim()).then(|| s.trim().to_string());
+    overrides
+        .extraction_thinking_level
+        .as_ref()
+        .and_then(valid)
+        .or_else(|| std::env::var("EXTRACTION_THINKING_LEVEL").ok().as_ref().and_then(valid))
+        .or_else(|| Some(DEFAULT_EXTRACTION_THINKING_LEVEL.to_string()))
+}
+
+/// Map a MEDIA_RESOLUTION value ("low"/"medium"/"high", full enum names
+/// accepted) to the API enum value. None = invalid.
+fn map_media_resolution(v: &str) -> Option<&'static str> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "low" | "media_resolution_low" => Some("MEDIA_RESOLUTION_LOW"),
+        "medium" | "media_resolution_medium" => Some("MEDIA_RESOLUTION_MEDIUM"),
+        "high" | "media_resolution_high" => Some("MEDIA_RESOLUTION_HIGH"),
+        _ => None,
+    }
+}
+
+/// env `MEDIA_RESOLUTION` ("low"|"medium"|"high", full enum names accepted)
+/// > None (model default). Boot-time only; invalid values are ignored.
+pub fn resolve_media_resolution() -> Option<String> {
+    let raw = std::env::var("MEDIA_RESOLUTION").ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match map_media_resolution(v) {
+        Some(m) => Some(m.to_string()),
+        None => {
+            warn!("Ignoring invalid MEDIA_RESOLUTION {v:?} (expected low|medium|high)");
+            None
+        }
+    }
 }
 
 /// override > env `EXTRACTION_MODEL` > None (None = use the generation model).
@@ -535,6 +583,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_thinking_level(&bogus), None);
+    }
+
+    #[test]
+    fn extraction_thinking_level_resolver_defaults_to_low() {
+        let empty = ConfigOverrides::default();
+        assert_eq!(
+            resolve_extraction_thinking_level(&empty),
+            Some(DEFAULT_EXTRACTION_THINKING_LEVEL.to_string()),
+            "untouched = the built-in low (Thinking docs: minimal/low for classification)"
+        );
+        let with = ConfigOverrides {
+            extraction_thinking_level: Some("minimal".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_extraction_thinking_level(&with), Some("minimal".to_string()));
+        // Invalid override falls back to the built-in default, never propagated.
+        let bogus = ConfigOverrides {
+            extraction_thinking_level: Some("very-hard".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_extraction_thinking_level(&bogus),
+            Some(DEFAULT_EXTRACTION_THINKING_LEVEL.to_string())
+        );
+    }
+
+    #[test]
+    fn media_resolution_mapping() {
+        assert_eq!(map_media_resolution("low"), Some("MEDIA_RESOLUTION_LOW"));
+        assert_eq!(map_media_resolution("MEDIUM"), Some("MEDIA_RESOLUTION_MEDIUM"));
+        assert_eq!(map_media_resolution(" media_resolution_high "), Some("MEDIA_RESOLUTION_HIGH"));
+        assert_eq!(map_media_resolution("ultra"), None);
+        assert_eq!(map_media_resolution(""), None);
     }
 
     #[test]

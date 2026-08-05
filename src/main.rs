@@ -165,12 +165,13 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let (generation_model, extraction_model, thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
+    let (generation_model, extraction_model, thinking_level, extraction_thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
         let cfg = bot_config.read().await;
         (
             config::resolve_generation_model(&cfg.overrides),
             config::resolve_extraction_model(&cfg.overrides),
             config::resolve_thinking_level(&cfg.overrides),
+            config::resolve_extraction_thinking_level(&cfg.overrides),
             config::resolve_embedding_model(&cfg.overrides),
             config::resolve_embedding_dimensions(&cfg.overrides),
             config::resolve_qdrant_url(&cfg.overrides),
@@ -178,11 +179,15 @@ async fn main() -> Result<()> {
     };
     let gemini = GeminiClient::with_keys(
         gemini_api_keys,
-        generation_model,
-        extraction_model,
-        thinking_level,
-        embedding_model.clone(),
-        embedding_dimensions as u32,
+        crate::gemini_client::GeminiOptions {
+            generation_model,
+            extraction_model,
+            thinking_level,
+            extraction_thinking_level,
+            media_resolution: config::resolve_media_resolution(),
+            embedding_model: embedding_model.clone(),
+            embedding_dimensions: embedding_dimensions as u32,
+        },
     );
 
     let runtime_config = Arc::new(RwLock::new(RuntimeConfig::resolve(

@@ -997,6 +997,11 @@ impl QdrantClient {
     /// Page through a collection with a filter, optionally server-side ordered
     /// by a payload key (requires a payload index on that key), decoding each
     /// point into `(PointId, payload)` pairs.
+    ///
+    /// Ordered scrolls paginate via `order_by.start_from` (the order-key
+    /// payload value of the last entry seen): the server does not accept a
+    /// point-id `offset` together with `order_by`, so an ordered page 2
+    /// fetched with `offset` would repeat page 1 or fail outright.
     async fn scroll_raw<T: serde::de::DeserializeOwned>(
         &self,
         client: &Qdrant,
@@ -1007,36 +1012,68 @@ impl QdrantClient {
     ) -> Result<Vec<(Option<PointId>, Option<T>)>> {
         let mut entries = Vec::new();
         let mut offset: Option<PointId> = None;
+        let mut start_from: Option<i64> = None;
+        let page_size = limit.min(100) as u32;
         loop {
             let mut builder = ScrollPointsBuilder::new(collection.to_string())
                 .filter(filter.clone())
-                .limit(limit.min(100) as u32)
+                .limit(page_size)
                 .with_payload(true)
                 .with_vectors(false);
             if let Some((key, direction)) = order {
                 builder = builder.order_by(OrderBy {
                     key: key.to_string(),
                     direction: Some(direction as i32),
-                    start_from: None,
+                    start_from: start_from.map(|v| qdrant_client::qdrant::StartFrom {
+                        value: Some(qdrant_client::qdrant::start_from::Value::Integer(v)),
+                    }),
                 });
-            }
-            if let Some(offset_id) = offset.clone() {
+            } else if let Some(offset_id) = offset.clone() {
                 builder = builder.offset(offset_id);
             }
             let response = client.scroll(builder).await?;
+            let page_len = response.result.len();
             for point in response.result {
+                if let Some((key, _)) = order {
+                    // Track the boundary value for the next page (same-second
+                    // timestamps on a page edge may skip a handful of entries
+                    // — vastly better than repeating the whole first page).
+                    if let Some(v) = payload_integer(&point.payload, key) {
+                        start_from = Some(v);
+                    }
+                }
                 let decoded = decode_payload::<T>(&point.payload);
                 entries.push((point.id, decoded));
                 if entries.len() as u64 >= limit {
                     return Ok(entries);
                 }
             }
-            match response.next_page_offset {
-                Some(next) => offset = Some(next),
-                None => break,
+            if order.is_some() {
+                // Ordered: continue via start_from while pages come back full.
+                if (page_len as u32) < page_size || start_from.is_none() {
+                    break;
+                }
+            } else {
+                match response.next_page_offset {
+                    Some(next) => offset = Some(next),
+                    None => break,
+                }
             }
         }
         Ok(entries)
+    }
+}
+
+/// Extract an integer payload value (feeds `order_by.start_from` pagination).
+fn payload_integer(
+    payload: &std::collections::HashMap<String, qdrant_client::qdrant::Value>,
+    key: &str,
+) -> Option<i64> {
+    use qdrant_client::qdrant::value::Kind;
+    match payload.get(key)?.kind.as_ref()? {
+        Kind::IntegerValue(v) => Some(*v),
+        Kind::DoubleValue(f) => Some(*f as i64),
+        _ => None,
     }
 }
 

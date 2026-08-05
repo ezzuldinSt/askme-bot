@@ -12,8 +12,10 @@ use crate::qdrant_client::Embedder;
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 10;
-const POLL_INTERVAL_MS: u64 = 1000;
-const MAX_POLL_ATTEMPTS: u32 = 60;
+/// Files API state polling: the docs poll every 5s; 24 attempts = ~2 min cap
+/// (large videos need longer than images to reach ACTIVE).
+const POLL_INTERVAL_MS: u64 = 5_000;
+const MAX_POLL_ATTEMPTS: u32 = 24;
 const EMBED_CACHE_MAX: usize = 2000;
 const HTTP_TIMEOUT_SECS: u64 = 120;
 const GENERATE_MAX_ATTEMPTS: u32 = 3;
@@ -183,7 +185,12 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
             // later tool rounds. Empty parts WITH a signature must circulate
             // (docs: signatures may arrive on empty text parts).
             if !t.is_empty() || part.thought_signature.is_some() {
-                text.push_str(&t);
+                // Thought-summary parts are NOT answer text: circulate them
+                // (they can carry signatures) but never accumulate them into
+                // the reply the user sees.
+                if part.thought != Some(true) {
+                    text.push_str(&t);
+                }
                 // Text parts can carry thought signatures (sometimes on an
                 // EMPTY text part); circulate them verbatim like every other
                 // part type.
@@ -277,6 +284,13 @@ pub struct GeminiClient {
     extraction_model: Arc<std::sync::RwLock<Option<String>>>,
     /// Gemini 3.x thinking level; None = model default. Hot-swappable.
     thinking_level: Arc<std::sync::RwLock<Option<String>>>,
+    /// Thinking level for extraction/FAQ/rewrite jobs (Thinking docs:
+    /// minimal/low for fact retrieval or classification). None = model
+    /// default. Hot-swappable (shared across clones).
+    extraction_thinking_level: Arc<std::sync::RwLock<Option<String>>>,
+    /// Global media resolution enum value (e.g. "MEDIA_RESOLUTION_LOW") from
+    /// the MEDIA_RESOLUTION env var; None = model default. Boot-time only.
+    media_resolution: Option<String>,
     embedding_model: String,
     embedding_dimensions: u32,
     embedding_batch_size: usize,
@@ -288,28 +302,45 @@ fn mask_key(key: &str) -> String {
     format!("••••{tail}")
 }
 
+/// Construction knobs for the Gemini client (keeps the constructor tidy).
+pub struct GeminiOptions {
+    pub generation_model: String,
+    pub extraction_model: Option<String>,
+    pub thinking_level: Option<String>,
+    pub extraction_thinking_level: Option<String>,
+    pub media_resolution: Option<String>,
+    pub embedding_model: String,
+    pub embedding_dimensions: u32,
+}
+
 impl GeminiClient {
     /// Back-compatible single-key constructor (used by tests).
     #[allow(dead_code)]
     pub fn new(api_key: String) -> Self {
         Self::with_keys(
             vec![api_key],
-            crate::config::DEFAULT_GENERATION_MODEL.to_string(),
-            None,
-            None,
-            crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
-            crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
+            GeminiOptions {
+                generation_model: crate::config::DEFAULT_GENERATION_MODEL.to_string(),
+                extraction_model: None,
+                thinking_level: None,
+                extraction_thinking_level: None,
+                media_resolution: None,
+                embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
+                embedding_dimensions: crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
+            },
         )
     }
 
-    pub fn with_keys(
-        api_keys: Vec<String>,
-        generation_model: String,
-        extraction_model: Option<String>,
-        thinking_level: Option<String>,
-        embedding_model: String,
-        embedding_dimensions: u32,
-    ) -> Self {
+    pub fn with_keys(api_keys: Vec<String>, options: GeminiOptions) -> Self {
+        let GeminiOptions {
+            generation_model,
+            extraction_model,
+            thinking_level,
+            extraction_thinking_level,
+            media_resolution,
+            embedding_model,
+            embedding_dimensions,
+        } = options;
         let embedding_batch_size = std::env::var("EMBEDDING_BATCH_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -334,6 +365,8 @@ impl GeminiClient {
             generation_model: Arc::new(std::sync::RwLock::new(generation_model)),
             extraction_model: Arc::new(std::sync::RwLock::new(extraction_model)),
             thinking_level: Arc::new(std::sync::RwLock::new(thinking_level)),
+            extraction_thinking_level: Arc::new(std::sync::RwLock::new(extraction_thinking_level)),
+            media_resolution,
             embedding_model,
             embedding_dimensions,
             embedding_batch_size,
@@ -385,6 +418,53 @@ impl GeminiClient {
     /// The currently configured thinking level (None = model default).
     pub fn thinking_level(&self) -> Option<String> {
         self.thinking_level.read().unwrap().clone()
+    }
+
+    /// Hot-swap the extraction thinking level (None = model default).
+    pub fn set_extraction_thinking_level(&self, level: Option<String>) {
+        let mut current = self.extraction_thinking_level.write().unwrap();
+        if *current != level {
+            info!("Extraction thinking level changed: {:?} -> {:?}", *current, level);
+            *current = level;
+        }
+    }
+
+    /// The currently configured extraction thinking level (None = model default).
+    pub fn extraction_thinking_level(&self) -> Option<String> {
+        self.extraction_thinking_level.read().unwrap().clone()
+    }
+
+    /// Assemble the generationConfig for one request family. `extraction`
+    /// selects the extraction thinking level (classification-grade) instead
+    /// of the chat level; `media` gates the global mediaResolution (only
+    /// requests that can carry media parts get it). Returns None when every
+    /// knob is unset so the field is omitted entirely.
+    fn build_generation_config(
+        &self,
+        response_mime_type: Option<String>,
+        response_schema: Option<serde_json::Value>,
+        extraction: bool,
+        media: bool,
+    ) -> Option<GenerationConfig> {
+        let thinking_level = if extraction {
+            self.extraction_thinking_level.read().unwrap().clone()
+        } else {
+            self.thinking_level.read().unwrap().clone()
+        };
+        let media_resolution = media.then(|| self.media_resolution.clone()).flatten();
+        if response_mime_type.is_none()
+            && response_schema.is_none()
+            && thinking_level.is_none()
+            && media_resolution.is_none()
+        {
+            return None;
+        }
+        Some(GenerationConfig {
+            response_mime_type,
+            response_schema,
+            media_resolution,
+            thinking_config: thinking_level.map(|level| ThinkingConfig { thinking_level: level }),
+        })
     }
 
     /// Hot-swap the key pool (admin panel). Surviving keys keep their stats;
@@ -744,7 +824,10 @@ impl GeminiClient {
 
             match file_resp.state.as_str() {
                 "ACTIVE" => {
-                    info!("File {file_name} is ACTIVE after {attempt}s");
+                    info!(
+                        "File {file_name} is ACTIVE after ~{}s",
+                        (attempt as u64 + 1) * POLL_INTERVAL_MS / 1000
+                    );
                     return Ok(());
                 }
                 "FAILED" => {
@@ -774,13 +857,23 @@ impl GeminiClient {
 
     // ── GenerateContent ──
 
-    /// Generate a response constrained to JSON (`responseMimeType`).
+    /// Generate a response constrained to a JSON Schema (`responseMimeType`
+    /// = application/json + `responseSchema` — Structured Outputs docs).
     /// Stateless call: rotates per request.
-    pub async fn generate_json(&self, system_prompt: &str, user_text: &str) -> Result<String> {
+    pub async fn generate_json(
+        &self,
+        system_prompt: &str,
+        user_text: &str,
+        schema: serde_json::Value,
+    ) -> Result<String> {
         let model = self.extraction_model();
         self.send_with_rotation(|key: String| {
             let model = model.clone();
-            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], true).await }
+            let schema = schema.clone();
+            async move {
+                self.try_generate(&key, &model, system_prompt, user_text, &[], Some(schema))
+                    .await
+            }
         })
         .await
     }
@@ -791,7 +884,7 @@ impl GeminiClient {
         let model = self.extraction_model();
         self.send_with_rotation(|key: String| {
             let model = model.clone();
-            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], false).await }
+            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], None).await }
         })
         .await
     }
@@ -857,6 +950,8 @@ impl GeminiClient {
     }
 
     /// One generateContent attempt with an explicit key and model.
+    /// `json_schema` constrains the response to a JSON Schema (Structured
+    /// Outputs); None produces a plain-text response.
     async fn try_generate(
         &self,
         key: &str,
@@ -864,7 +959,7 @@ impl GeminiClient {
         system_prompt: &str,
         user_text: &str,
         file_uris: &[(String, String)],
-        json_mode: bool,
+        json_schema: Option<serde_json::Value>,
     ) -> Result<String, AttemptFailure> {
         let mut parts: Vec<Part> = Vec::new();
 
@@ -895,18 +990,12 @@ impl GeminiClient {
             }],
             tools: None,
             tool_config: None,
-            generation_config: {
-                let thinking_level = self.thinking_level.read().unwrap().clone();
-                if json_mode || thinking_level.is_some() {
-                    Some(GenerationConfig {
-                        response_mime_type: json_mode.then(|| "application/json".to_string()),
-                        thinking_config: thinking_level
-                            .map(|level| ThinkingConfig { thinking_level: level }),
-                    })
-                } else {
-                    None
-                }
-            },
+            generation_config: self.build_generation_config(
+                json_schema.is_some().then(|| "application/json".to_string()),
+                json_schema,
+                true,
+                false,
+            ),
         };
 
         let response = self.send_generate(key, model, request).await?;
@@ -923,13 +1012,21 @@ impl GeminiClient {
             .and_then(|f| f.blockReason.as_deref())
             .map(|s| s.to_string());
 
+        // Concatenate EVERY non-thought text part: a response split across
+        // multiple text parts must not lose its tail (JSON payloads
+        // especially — a truncated document silently fails to parse).
         let text = response
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content)
             .and_then(|c| c.parts)
-            .and_then(|p| p.into_iter().next())
-            .and_then(|p| p.text)
+            .map(|parts| {
+                parts
+                    .into_iter()
+                    .filter(|p| p.thought != Some(true))
+                    .filter_map(|p| p.text)
+                    .collect::<String>()
+            })
             .unwrap_or_default();
 
         // An empty candidate (safety block, recitation filter, ...) must not be
@@ -986,11 +1083,24 @@ impl GeminiClient {
             return Err(classify_http_failure(status, &bytes));
         }
 
-        serde_json::from_slice(&bytes).map_err(|e| {
+        let response: GenerateContentResponse = serde_json::from_slice(&bytes).map_err(|e| {
             AttemptFailure::Fatal(
                 anyhow::Error::new(e).context("Failed to parse Gemini generateContent response"),
             )
-        })
+        })?;
+
+        // Token accounting per call (Thinking docs: billed output = candidates
+        // + thoughts) — visibility into what each reply/extraction costs.
+        if let Some(u) = &response.usageMetadata {
+            info!(
+                "Gemini {model} usage: {} prompt + {} candidates + {} thoughts = {} tokens",
+                u.promptTokenCount.unwrap_or(0),
+                u.candidatesTokenCount.unwrap_or(0),
+                u.thoughtsTokenCount.unwrap_or(0),
+                u.totalTokenCount.unwrap_or(0),
+            );
+        }
+        Ok(response)
     }
 
     /// One tool-calling generateContent attempt: sends the full contents
@@ -1005,8 +1115,10 @@ impl GeminiClient {
     ) -> Result<GenerateTurn, AttemptFailure> {
         // Built-in tools (url_context) combined with function declarations
         // require server-side tool context circulation: without the flag the
-        // API rejects the request (400 INVALID_ARGUMENT).
-        let has_builtin_tool = tools.iter().any(|t| t.url_context.is_some());
+        // API rejects the request (400 INVALID_ARGUMENT). The flag must ALSO
+        // stay on when the history already carries server-side toolCall/
+        // toolResponse parts — e.g. the final no-tools answer call after a
+        // run of tool rounds, which declares no tools at all.
         let request = GenerateContentRequest {
             system_instruction: Some(SystemInstruction {
                 parts: vec![Part::Text {
@@ -1016,21 +1128,10 @@ impl GeminiClient {
             }),
             contents: contents.to_vec(),
             tools: (!tools.is_empty()).then(|| tools.to_vec()),
-            tool_config: has_builtin_tool.then_some(ToolConfig {
+            tool_config: needs_tool_config(tools, contents).then_some(ToolConfig {
                 include_server_side_tool_invocations: true,
             }),
-            generation_config: {
-                let thinking_level = self.thinking_level.read().unwrap().clone();
-                if thinking_level.is_some() {
-                    Some(GenerationConfig {
-                        response_mime_type: None,
-                        thinking_config: thinking_level
-                            .map(|level| ThinkingConfig { thinking_level: level }),
-                    })
-                } else {
-                    None
-                }
-            },
+            generation_config: self.build_generation_config(None, None, false, true),
         };
 
         let response = self
@@ -1157,6 +1258,20 @@ impl GeminiClient {
         })?;
         collect_embeddings(parsed, chunk.len()).map_err(AttemptFailure::Fatal)
     }
+}
+
+/// Server-side tool context circulation must be enabled whenever the request
+/// declares a built-in tool (url_context) OR the outgoing history already
+/// carries server-side toolCall/toolResponse parts — otherwise the API
+/// rejects the echo with 400 INVALID_ARGUMENT. The second case covers the
+/// final no-tools answer call after a run of tool rounds.
+fn needs_tool_config(tools: &[Tool], contents: &[Content]) -> bool {
+    tools.iter().any(|t| t.url_context.is_some())
+        || contents.iter().any(|c| {
+            c.parts
+                .iter()
+                .any(|p| matches!(p, Part::ToolCall { .. } | Part::ToolResponse { .. }))
+        })
 }
 
 fn backoff(transient_retries: u32) -> Duration {
@@ -1288,14 +1403,37 @@ fn parse_retry_delay(s: &str) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs))
 }
 
-/// Daily free-tier quota resets at midnight Pacific (~08:00 UTC).
-fn daily_cooldown_duration() -> Duration {
-    let now = chrono::Utc::now();
-    let today_8utc = now
+/// The nth Sunday of a month (US DST rule: PDT runs from the 2nd Sunday of
+/// March to the 1st Sunday of November).
+fn nth_sunday(year: i32, month: u32, n: u32) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).expect("valid date");
+    let offset = (7 - first.weekday().num_days_from_sunday()) % 7;
+    first + chrono::Duration::days((offset + 7 * (n - 1)) as i64)
+}
+
+/// Hours behind UTC at midnight Pacific on the given date: 8 during PST,
+/// 7 during PDT. The daily free-tier quota resets at midnight Pacific, so
+/// the cooldown target moves with DST.
+fn pacific_utc_offset_hours(date: chrono::NaiveDate) -> u32 {
+    use chrono::Datelike;
+    let year = date.year();
+    if date >= nth_sunday(year, 3, 2) && date < nth_sunday(year, 11, 1) {
+        7
+    } else {
+        8
+    }
+}
+
+/// Daily free-tier quota resets at midnight Pacific (08:00 UTC in PST,
+/// 07:00 UTC in PDT). Split from `daily_cooldown_duration` for testability.
+fn daily_cooldown_from(now: chrono::DateTime<chrono::Utc>) -> Duration {
+    let offset = pacific_utc_offset_hours(now.date_naive());
+    let today_reset = now
         .date_naive()
-        .and_hms_opt(8, 0, 0)
+        .and_hms_opt(offset, 0, 0)
         .map(|dt| dt.and_utc());
-    let target = match today_8utc {
+    let target = match today_reset {
         Some(t) if now < t => t,
         Some(t) => t + chrono::Duration::days(1),
         None => return Duration::from_secs(3600),
@@ -1303,6 +1441,10 @@ fn daily_cooldown_duration() -> Duration {
     (target - now)
         .to_std()
         .unwrap_or_else(|_| Duration::from_secs(3600))
+}
+
+fn daily_cooldown_duration() -> Duration {
+    daily_cooldown_from(chrono::Utc::now())
 }
 
 #[async_trait::async_trait]
@@ -1363,9 +1505,50 @@ impl GeminiClient {
     /// workflow: unparseable output degrades to "nothing extracted".
     pub async fn extract_facts(&self, username: &str, text: &str) -> Result<ExtractedFacts> {
         let user_text = format!("[Message by {username}] {text}");
-        let raw = self.generate_json(EXTRACTION_PROMPT, &user_text).await?;
+        let raw = self
+            .generate_json(EXTRACTION_PROMPT, &user_text, extraction_schema())
+            .await?;
         Ok(parse_extracted_facts(&raw))
     }
+}
+
+/// JSON Schema for the extraction pass (Structured Outputs docs: schema
+/// constrains the shape instead of hoping the prose prompt does; every field
+/// required per the troubleshooting guide). The lenient parser stays as a
+/// fallback safety net.
+fn extraction_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "user_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fact": { "type": "string" },
+                        "category": {
+                            "type": "string",
+                            "enum": ["identity", "location", "occupation", "preference", "opinion", "other"]
+                        }
+                    },
+                    "required": ["fact", "category"]
+                }
+            },
+            "app_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fact": { "type": "string" },
+                        "topic": { "type": "string" }
+                    },
+                    "required": ["fact", "topic"]
+                }
+            },
+            "forget": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["user_facts", "app_facts", "forget"]
+    })
 }
 
 /// Leniently parse the extractor's JSON output: strips markdown code fences
@@ -1492,6 +1675,131 @@ mod tests {
     }
 
     #[test]
+    fn parse_turn_concatenates_text_parts_and_skips_thought_parts() {
+        // B1/B2: every non-thought text part contributes to the answer;
+        // thought-summary parts circulate for signatures but are not text.
+        let raw = r#"{
+            "candidates": [{
+                "content": { "parts": [
+                    {"text": "let me think about this", "thought": true, "thoughtSignature": "sig-t"},
+                    {"text": "{\"user_facts\":"},
+                    {"text": " [],\"app_facts\":[],\"forget\":[]}"}
+                ], "role": "model" }
+            }]
+        }"#;
+        let response: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let turn = parse_turn(response).unwrap_or_else(|_| panic!("turn parses"));
+        assert_eq!(
+            turn.text.as_deref(),
+            Some("{\"user_facts\": [],\"app_facts\":[],\"forget\":[]}"),
+            "split text parts concatenated, thought text excluded"
+        );
+        assert_eq!(turn.raw_parts.len(), 3, "thought part still circulated");
+        assert!(
+            matches!(&turn.raw_parts[0], Part::Text { text, thought_signature }
+                if text == "let me think about this" && thought_signature.as_deref() == Some("sig-t")),
+            "thought part keeps its signature for circulation"
+        );
+    }
+
+    #[test]
+    fn needs_tool_config_covers_builtins_and_history_tool_parts() {
+        use crate::models::{ToolCallData, ToolResponseData};
+        let url_tool = Tool::url_context();
+        let fn_tool = Tool {
+            function_declarations: vec![crate::models::FunctionDeclaration {
+                name: "f".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            url_context: None,
+        };
+        let text_content = |s: &str| Content {
+            role: "user".to_string(),
+            parts: vec![Part::Text {
+                text: s.to_string(),
+                thought_signature: None,
+            }],
+        };
+        // Built-in tool declared -> on.
+        assert!(needs_tool_config(std::slice::from_ref(&url_tool), &[text_content("hi")]));
+        // Only function declarations, plain history -> off.
+        assert!(!needs_tool_config(std::slice::from_ref(&fn_tool), &[text_content("hi")]));
+        // No tools at all, plain history -> off.
+        assert!(!needs_tool_config(&[], &[text_content("hi")]));
+        // No tools, but the history carries server-side tool parts -> ON
+        // (the final no-tools answer call after tool rounds — B3).
+        let history_with_tool_parts = vec![
+            text_content("hi"),
+            Content {
+                role: "model".to_string(),
+                parts: vec![
+                    Part::ToolCall {
+                        tool_call: ToolCallData {
+                            tool_type: "url_context".to_string(),
+                            args: serde_json::json!({}),
+                            id: Some("t1".to_string()),
+                        },
+                        thought_signature: None,
+                    },
+                    Part::ToolResponse {
+                        tool_response: ToolResponseData {
+                            tool_type: "url_context".to_string(),
+                            response: serde_json::json!({}),
+                            id: Some("t1".to_string()),
+                        },
+                        thought_signature: None,
+                    },
+                ],
+            },
+        ];
+        assert!(needs_tool_config(&[], &history_with_tool_parts));
+    }
+
+    // ── Pacific daily-reset math (B4) ──
+
+    fn utc(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    #[test]
+    fn pacific_offset_follows_us_dst() {
+        use chrono::NaiveDate;
+        // PDT window: 2nd Sunday of March .. 1st Sunday of November.
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap()), 7);
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 3, 8).unwrap()), 7);
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 3, 7).unwrap()), 8);
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()), 8);
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()), 8);
+        assert_eq!(pacific_utc_offset_hours(NaiveDate::from_ymd_opt(2026, 10, 31).unwrap()), 7);
+        // 2026 transition sanity: Mar 8 and Nov 1 are Sundays.
+        assert_eq!(nth_sunday(2026, 3, 2), NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
+        assert_eq!(nth_sunday(2026, 11, 1), NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+    }
+
+    #[test]
+    fn daily_cooldown_targets_midnight_pacific() {
+        // PDT (August): midnight Pacific = 07:00 UTC same day.
+        let d = daily_cooldown_from(utc(2026, 8, 5, 12, 0));
+        assert_eq!(d, Duration::from_secs(19 * 3600));
+        // Before the reset on the same day: target is today's 07:00 UTC.
+        let d = daily_cooldown_from(utc(2026, 8, 5, 6, 0));
+        assert_eq!(d, Duration::from_secs(3600));
+        // PST (January): midnight Pacific = 08:00 UTC.
+        let d = daily_cooldown_from(utc(2026, 1, 15, 12, 0));
+        assert_eq!(d, Duration::from_secs(20 * 3600));
+        // Always in the future and within a day.
+        for now in [utc(2026, 8, 5, 0, 0), utc(2026, 8, 5, 23, 59), utc(2026, 1, 15, 7, 59)] {
+            let d = daily_cooldown_from(now);
+            assert!(d > Duration::ZERO && d <= Duration::from_secs(86400));
+        }
+    }
+
+    #[test]
     fn classify_400_invalid_argument_fails_over_not_fatal() {
         assert!(matches!(
             classify_http_failure(
@@ -1520,11 +1828,15 @@ mod tests {
     fn client_with_keys(n: usize) -> GeminiClient {
         GeminiClient::with_keys(
             (0..n).map(|i| format!("key-{i:04}")).collect(),
-            crate::config::DEFAULT_GENERATION_MODEL.to_string(),
-            None,
-            None,
-            crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
-            crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
+            GeminiOptions {
+                generation_model: crate::config::DEFAULT_GENERATION_MODEL.to_string(),
+                extraction_model: None,
+                thinking_level: None,
+                extraction_thinking_level: None,
+                media_resolution: None,
+                embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.to_string(),
+                embedding_dimensions: crate::config::DEFAULT_EMBEDDING_DIMENSIONS,
+            },
         )
     }
 
@@ -1697,6 +2009,8 @@ mod tests {
     fn thinking_config_serializes_camel_case_like_the_rest_docs() {
         let cfg = GenerationConfig {
             response_mime_type: None,
+            response_schema: None,
+            media_resolution: None,
             thinking_config: Some(ThinkingConfig {
                 thinking_level: "low".to_string(),
             }),
@@ -1706,9 +2020,68 @@ mod tests {
         // Without a level the field is omitted entirely (model default path).
         let plain = GenerationConfig {
             response_mime_type: None,
+            response_schema: None,
+            media_resolution: None,
             thinking_config: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn generation_config_serializes_schema_and_media_resolution() {
+        let cfg = GenerationConfig {
+            response_mime_type: Some("application/json".to_string()),
+            response_schema: Some(serde_json::json!({"type": "object"})),
+            media_resolution: Some("MEDIA_RESOLUTION_LOW".to_string()),
+            thinking_config: None,
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "responseMimeType": "application/json",
+                "responseSchema": {"type": "object"},
+                "mediaResolution": "MEDIA_RESOLUTION_LOW"
+            })
+        );
+    }
+
+    #[test]
+    fn extraction_thinking_level_hot_swap_propagates_to_clones() {
+        let client = client_with_keys(1);
+        let clone = client.clone();
+        assert_eq!(client.extraction_thinking_level(), None);
+        client.set_extraction_thinking_level(Some("minimal".to_string()));
+        assert_eq!(clone.extraction_thinking_level(), Some("minimal".to_string()));
+        client.set_extraction_thinking_level(None);
+        assert_eq!(clone.extraction_thinking_level(), None);
+    }
+
+    #[test]
+    fn build_generation_config_picks_the_right_thinking_level() {
+        let client = client_with_keys(1);
+        client.set_thinking_level(Some("high".to_string()));
+        client.set_extraction_thinking_level(Some("minimal".to_string()));
+        // Chat path: chat level + media resolution gate.
+        let chat = client
+            .build_generation_config(None, None, false, true)
+            .expect("chat config present");
+        assert_eq!(
+            chat.thinking_config.map(|t| t.thinking_level).as_deref(),
+            Some("high")
+        );
+        // Extraction path: the cheaper extraction level, no media resolution.
+        let extract = client
+            .build_generation_config(Some("application/json".to_string()), None, true, false)
+            .expect("extraction config present");
+        assert_eq!(
+            extract.thinking_config.map(|t| t.thinking_level).as_deref(),
+            Some("minimal")
+        );
+        assert_eq!(extract.response_mime_type.as_deref(), Some("application/json"));
+        // Everything unset -> the whole field is omitted.
+        let bare = client_with_keys(1);
+        assert!(bare.build_generation_config(None, None, false, false).is_none());
     }
 
     #[test]

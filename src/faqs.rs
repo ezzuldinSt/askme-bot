@@ -79,6 +79,17 @@ Rules:
 - Facts must stand alone WITHOUT the question text: include the subject ("To change your profile picture: go to Profile, tap Edit, then tap the photo" — not "Tap the photo").
 - Never invent steps or features that are not in the answer. If the answer contains nothing actionable, return an empty array."#;
 
+/// JSON Schema for the FAQ distiller (Structured Outputs docs).
+fn faq_facts_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "facts": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["facts"]
+    })
+}
+
 /// Distill one FAQ into English support facts via Gemini (stateless call,
 /// key-rotating). Unparseable output degrades to "no facts".
 pub async fn extract_faq_facts(
@@ -88,7 +99,7 @@ pub async fn extract_faq_facts(
 ) -> Result<Vec<String>> {
     let user_text = format!("[FAQ]\nQuestion: {question}\nAnswer: {answer}");
     let raw = gemini
-        .generate_json(FAQ_EXTRACTION_PROMPT, &user_text)
+        .generate_json(FAQ_EXTRACTION_PROMPT, &user_text, faq_facts_schema())
         .await?;
     Ok(parse_faq_facts(&raw))
 }

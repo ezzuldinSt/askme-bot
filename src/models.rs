@@ -374,6 +374,16 @@ pub struct ToolConfig {
 pub struct GenerationConfig {
     #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
     pub response_mime_type: Option<String>,
+    /// JSON Schema constraining the response (requires `responseMimeType` =
+    /// "application/json"). Guarantees field names/types instead of relying
+    /// on the model to honor a prose-described shape.
+    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
+    /// Global media resolution for every media part in the request
+    /// ("MEDIA_RESOLUTION_LOW" / ..._MEDIUM / ..._HIGH). Per-part overrides
+    /// are v1alpha-only, so the global config is the v1beta way.
+    #[serde(rename = "mediaResolution", skip_serializing_if = "Option::is_none")]
+    pub media_resolution: Option<String>,
     #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<ThinkingConfig>,
 }
@@ -492,6 +502,11 @@ pub struct ContentResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartResponse {
     pub text: Option<String>,
+    /// True on thought-summary parts (Thinking docs). Thought text is NOT
+    /// answer text: it must never be concatenated into a reply (or a JSON
+    /// payload), only circulated for its signature.
+    #[serde(rename = "thought", default)]
+    pub thought: Option<bool>,
     #[serde(rename = "functionCall")]
     pub function_call: Option<FunctionCallData>,
     #[serde(rename = "functionResponse")]
@@ -509,6 +524,8 @@ pub struct UsageMetadata {
     pub promptTokenCount: Option<i32>,
     pub candidatesTokenCount: Option<i32>,
     pub totalTokenCount: Option<i32>,
+    /// Billed thinking tokens (Thinking docs: output price = output + thoughts).
+    pub thoughtsTokenCount: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

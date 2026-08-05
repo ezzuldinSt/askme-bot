@@ -16,3 +16,6 @@ qdrant_data/
 
 # opencode agent config (skills, commands)
 .opencode/
+
+# Local Gemini API reference docs (kept out of the repo on purpose)
+Gemini-API-Reference/
