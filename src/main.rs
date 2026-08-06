@@ -510,10 +510,16 @@ async fn test_post(
             println!("  - {}", fact.fact);
         }
 
-        let app_hits = qdrant
-            .search_app_knowledge(&question, app_min_score, app_limit)
-            .await
-            .unwrap_or_default();
+        let app_hits = if question.trim().chars().count()
+            < MIN_APP_KNOWLEDGE_QUESTION_CHARS
+        {
+            Vec::new()
+        } else {
+            qdrant
+                .search_app_knowledge(&question, app_min_score, app_limit)
+                .await
+                .unwrap_or_default()
+        };
         println!("=== Qdrant app knowledge ({} hits) ===", app_hits.len());
         for fact in &app_hits {
             println!("  - {}", fact.fact);

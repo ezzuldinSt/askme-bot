@@ -653,6 +653,9 @@ impl ToolContext {
         let Some(query) = arg_str(args, "query") else {
             return err("missing query argument");
         };
+        if query.trim().is_empty() {
+            return err("query must not be empty");
+        }
         if !self.qdrant.is_available() {
             return err("memory is unavailable");
         }

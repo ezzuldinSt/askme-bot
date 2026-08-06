@@ -295,7 +295,14 @@ impl QdrantClient {
     }
 
     /// Embed a single text and return the normalized vector.
+    ///
+    /// Blank texts embed to the zero vector instead of hitting the API: the
+    /// embedding service rejects empty parts (400 INVALID_ARGUMENT) and the
+    /// key pool would cool every key down for minutes.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        if text.trim().is_empty() {
+            return Ok(self.zero_vector());
+        }
         let mut vectors = self.embedder.embed_texts(&[text.to_string()]).await?;
         vectors
             .pop()
@@ -453,6 +460,11 @@ impl QdrantClient {
         conversation_id: u64,
         limit: u64,
     ) -> Result<Vec<MemoryEntry>> {
+        // Blank queries never reach the embedding service (empty parts 400
+        // and cool every key down); an empty query matches nothing anyway.
+        if query_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let client = self.client()?;
         let vector = self.embed(query_text).await?;
         let filter = Filter::all([Condition::matches(
@@ -825,6 +837,11 @@ impl QdrantClient {
         min_score: f32,
         limit: u64,
     ) -> Result<Vec<AppFactPayload>> {
+        // Blank queries never reach the embedding service (empty parts 400
+        // and cool every key down); an empty query matches nothing anyway.
+        if query_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let client = self.client()?;
         let vector = self.embed(query_text).await?;
         let filter = Filter::all([Condition::matches(
@@ -1125,6 +1142,7 @@ fn point_id_uuid(point_id: PointId) -> Option<Uuid> {
 mod tests {
     use super::*;
     use crate::qdrant_models::MessageType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn unavailable_client_errors_gracefully() {
@@ -1199,6 +1217,47 @@ mod tests {
                 .sum::<f32>() as f64;
             let norm = norm.sqrt();
             assert!((norm - 1.0).abs() < 1e-3);
+        });
+    }
+
+    struct CountingEmbedder(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![vec![0.0; 4]; texts.len()])
+        }
+    }
+
+    fn unavailable_with_counts() -> (Arc<QdrantClient>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = QdrantClient::unavailable(Arc::new(CountingEmbedder(calls.clone())), 4);
+        (Arc::new(client), calls)
+    }
+
+    #[test]
+    fn blank_queries_never_reach_the_embedder() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client, calls) = unavailable_with_counts();
+            assert!(client
+                .search_app_knowledge("", 0.65, 3)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(client
+                .search_app_knowledge("   ", 0.65, 3)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(client
+                .search_conversation("", 1, 5)
+                .await
+                .unwrap()
+                .is_empty());
+            let zero = client.embed("").await.unwrap();
+            assert!(zero.iter().all(|x| *x == 0.0));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
     }
 }
