@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{info, warn};
 
 use crate::config::RuntimeConfig;
+use crate::games::{GameOutcome, GameStore};
 use crate::models::*;
 use crate::qdrant_client::QdrantClient;
 use crate::qdrant_models::UserFactPayload;
@@ -155,6 +156,13 @@ impl FlowMeter {
     }
 }
 
+/// Gaming-mode wiring for `ToolContext::new` (keeps the constructor tidy):
+/// the shared store plus the thread this flow belongs to.
+pub struct GameHooks {
+    pub store: Arc<Mutex<GameStore>>,
+    pub conversation_id: u64,
+}
+
 /// Shared handles the tools need. Built once per reply flow (cheap Arc clones).
 #[derive(Clone)]
 pub struct ToolContext {
@@ -172,6 +180,11 @@ pub struct ToolContext {
     /// from cache is instant and stops mid-flow state changes (e.g. a fact
     /// learned between rounds) from provoking re-query loops.
     cache: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// The game store (shared with the reply flow, which renders the active
+    /// game's prompt section). `manage_game` persists through it.
+    games: Arc<Mutex<GameStore>>,
+    /// The thread this flow belongs to — game state is keyed by it.
+    conversation_id: u64,
 }
 
 impl ToolContext {
@@ -182,6 +195,7 @@ impl ToolContext {
         extraction_tx: mpsc::UnboundedSender<ExtractionTask>,
         flow_subjects: Arc<Mutex<Vec<FlowSubject>>>,
         meter: Arc<FlowMeter>,
+        games: GameHooks,
     ) -> Self {
         Self {
             things,
@@ -191,6 +205,8 @@ impl ToolContext {
             flow_subjects,
             meter,
             cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            games: games.store,
+            conversation_id: games.conversation_id,
         }
     }
 
@@ -208,6 +224,10 @@ impl ToolContext {
 
     pub async fn search_grounding_enabled(&self) -> bool {
         self.runtime.read().await.tools.search_grounding_enabled
+    }
+
+    pub async fn games_enabled(&self) -> bool {
+        self.runtime.read().await.tools.games_enabled
     }
 
     /// Execute one requested tool call and return the JSON result the model
@@ -235,6 +255,7 @@ impl ToolContext {
             "get_post" => self.get_post(args).await,
             "get_thread" => self.get_thread(args).await,
             "get_current_time" => self.get_current_time(args),
+            "manage_game" => self.manage_game(args).await,
             other => {
                 warn!("Tool call to unknown tool {other}");
                 json!({ "error": format!("unknown tool: {other}") })
@@ -758,6 +779,103 @@ impl ToolContext {
             "unix_timestamp": now.timestamp(),
         })
     }
+
+    // ── Gaming mode ──
+
+    /// The `manage_game` tool: persist game state for this flow's thread.
+    /// The model owns the rules and the state blob; the store only keeps it
+    /// honest across turns and credits all-time scores on `end`.
+    async fn manage_game(&self, args: &Value) -> Value {
+        if !self.runtime.read().await.tools.games_enabled {
+            return err("games are disabled");
+        }
+        let Some(action) = arg_str(args, "action") else {
+            return err("missing action argument (start|update|end|score)");
+        };
+        let conversation_id = self.conversation_id;
+        let mut store = self.games.lock().unwrap();
+        match action {
+            "start" => {
+                let Some(game) = arg_str(args, "game") else {
+                    return err("missing game argument");
+                };
+                if crate::games::game_display_name(game).is_none() {
+                    return err(format!(
+                        "unknown game {game:?}; valid games: {}",
+                        crate::games::valid_game_names()
+                    ));
+                }
+                let Some(player) = arg_str(args, "player") else {
+                    return err("missing player argument (the opponent's username, no @)");
+                };
+                let secret = args
+                    .get("secret")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let data = args.get("state").cloned().unwrap_or_else(|| json!({}));
+                let state = store.start_game(conversation_id, game, player, secret, data);
+                info!("Game started in conversation {conversation_id}: {} vs {player}", state.game);
+                json!({
+                    "ok": true,
+                    "game": state.game,
+                    "turn": state.turn,
+                    "note": "Game started and persisted. Call manage_game(update) after EVERY move so the next turn sees the new state; call manage_game(end, result) when it finishes.",
+                })
+            }
+            "update" => {
+                let secret = args
+                    .get("secret")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let turn = args.get("turn").and_then(|v| v.as_u64()).map(|t| t as u32);
+                let data = args.get("state").cloned();
+                match store.update_game(conversation_id, secret, turn, data) {
+                    Some(state) => json!({ "ok": true, "turn": state.turn }),
+                    None => err("no active game in this conversation — start one first"),
+                }
+            }
+            "end" => {
+                let Some(raw) = arg_str(args, "result") else {
+                    return err("missing result argument (win|loss|draw — from the PLAYER's side)");
+                };
+                let Some(outcome) = GameOutcome::parse(raw) else {
+                    return err("result must be win, loss, or draw (from the player's side)");
+                };
+                match store.end_game(conversation_id, outcome) {
+                    Some(state) => {
+                        let record = store.score(&state.player);
+                        info!(
+                            "Game ended in conversation {conversation_id}: {} vs {} ({raw})",
+                            state.game, state.player
+                        );
+                        json!({
+                            "ok": true,
+                            "game": state.game,
+                            "turns_played": state.turn,
+                            "player_record": record.map(|s| json!({
+                                "plays": s.plays, "wins": s.wins, "losses": s.losses, "draws": s.draws,
+                            })),
+                        })
+                    }
+                    None => err("no active game in this conversation"),
+                }
+            }
+            "score" => {
+                let Some(player) = arg_str(args, "player") else {
+                    return err("missing player argument");
+                };
+                match store.score(player) {
+                    Some(s) => json!({
+                        "player": player,
+                        "plays": s.plays, "wins": s.wins, "losses": s.losses, "draws": s.draws,
+                        "per_game": s.per_game,
+                    }),
+                    None => json!({ "player": player, "plays": 0, "note": "no recorded games yet" }),
+                }
+            }
+            other => err(format!("unknown action {other:?} (start|update|end|score)")),
+        }
+    }
 }
 
 /// Query strings to try for a user search: the original first, then Latin
@@ -1001,8 +1119,13 @@ pub fn profile_scan_text(username: &str, contents: &[&str]) -> String {
 /// tool rounds. When `search_grounding_enabled` is set, the built-in Google
 /// Search tool is added too — and the custom `web_search` (Exa/DDG) is left
 /// out: grounding answers search-needing questions in one server-side turn,
-/// so the two-round custom path would only compete with it.
-pub fn tool_declarations(url_context_enabled: bool, search_grounding_enabled: bool) -> Vec<Tool> {
+/// so the two-round custom path would only compete with it. When
+/// `games_enabled` is set, the `manage_game` state tool joins the set.
+pub fn tool_declarations(
+    url_context_enabled: bool,
+    search_grounding_enabled: bool,
+    games_enabled: bool,
+) -> Vec<Tool> {
     let params = |properties: Value, required: &[&str]| {
         let mut p = json!({ "type": "object", "properties": properties });
         if !required.is_empty() {
@@ -1150,6 +1273,29 @@ pub fn tool_declarations(url_context_enabled: bool, search_grounding_enabled: bo
             }],
         },
     ]);
+
+    if games_enabled {
+        tools.push(Tool {
+            url_context: None,
+            google_search: None,
+            function_declarations: vec![FunctionDeclaration {
+                name: "manage_game".to_string(),
+                description: "Persist the state of a text game you are hosting in this conversation (see the GAMES section of your instructions). Use action=start when the user agrees to play (record the game, the player's username, the secret answer if the game has one, and the initial state); action=update after EVERY move with the full new state; action=end with result when the game finishes (records the player's all-time score); action=score to look up a player's all-time record. One active game per conversation.".to_string(),
+                parameters: params(
+                    json!({
+                        "action": { "type": "string", "description": "start | update | end | score" },
+                        "game": { "type": "string", "description": "Game key, e.g. hangman, twenty_questions, trivia (required for start)" },
+                        "player": { "type": "string", "description": "The opponent's username without @ (required for start/score)" },
+                        "secret": { "type": "string", "description": "The hidden answer only YOU may know (the word, the figure, ...). Stored server-side, never shown to the user. Set at start; change mid-game only if the game demands it." },
+                        "turn": { "type": "integer", "description": "Current turn number (update only; defaults to previous + 1)" },
+                        "state": { "type": "object", "description": "The full game-specific state blob: guessed letters, questions left, board grid, story chapter, match score, ... It is sent back to you each turn." },
+                        "result": { "type": "string", "description": "win | loss | draw — from the PLAYER's perspective (end only)" },
+                    }),
+                    &["action"],
+                ),
+            }],
+        });
+    }
 
     tools
 }
@@ -1342,7 +1488,7 @@ mod tests {
 
     #[test]
     fn tool_declarations_have_expected_tools() {
-        let tools = tool_declarations(true, false);
+        let tools = tool_declarations(true, false, true);
         let names: Vec<&str> = tools
             .iter()
             .flat_map(|t| &t.function_declarations)
@@ -1361,6 +1507,7 @@ mod tests {
                 "get_post",
                 "get_thread",
                 "get_current_time",
+                "manage_game",
             ]
         );
         let serialized = serde_json::to_value(&tools).unwrap();
@@ -1371,11 +1518,23 @@ mod tests {
     }
 
     #[test]
+    fn manage_game_only_when_games_enabled() {
+        let has_manage_game = |tools: Vec<Tool>| {
+            tools
+                .iter()
+                .flat_map(|t| &t.function_declarations)
+                .any(|f| f.name == "manage_game")
+        };
+        assert!(has_manage_game(tool_declarations(true, false, true)));
+        assert!(!has_manage_game(tool_declarations(true, false, false)));
+    }
+
+    #[test]
     fn url_context_tool_included_when_enabled() {
-        let on = serde_json::to_value(tool_declarations(true, false)).unwrap();
+        let on = serde_json::to_value(tool_declarations(true, false, true)).unwrap();
         assert!(on[0]["urlContext"].is_object(), "url_context tool first when enabled");
 
-        let off = serde_json::to_value(tool_declarations(false, false)).unwrap();
+        let off = serde_json::to_value(tool_declarations(false, false, true)).unwrap();
         let off_array = off.as_array().expect("serialized tools are an array");
         assert!(
             off_array
@@ -1387,7 +1546,7 @@ mod tests {
 
     #[test]
     fn search_grounding_replaces_custom_web_search() {
-        let on = serde_json::to_value(tool_declarations(true, true)).unwrap();
+        let on = serde_json::to_value(tool_declarations(true, true, true)).unwrap();
         let on_array = on.as_array().expect("serialized tools are an array");
         assert!(
             on_array.iter().any(|t| t["googleSearch"].is_object()),
@@ -1407,7 +1566,7 @@ mod tests {
             "web_fetch stays — grounding doesn't read full pages"
         );
 
-        let off = serde_json::to_value(tool_declarations(true, false)).unwrap();
+        let off = serde_json::to_value(tool_declarations(true, false, true)).unwrap();
         let off_array = off.as_array().expect("serialized tools are an array");
         assert!(
             off_array.iter().all(|t| t["googleSearch"].is_null()),

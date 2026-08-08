@@ -32,6 +32,9 @@ Cities, countries, landmarks, and @usernames are highlighted in **bold** so answ
 ### 🔁 Never repeats itself
 Each mention is handled exactly once, even if the network hiccups. No double replies, no spam.
 
+### 🎮 Plays games with you
+Say "@AskMe نلعب" and it hosts one of 15 text games in the thread — المشنوق (hangman), 20 سؤال, إنسان حيوان جماد, تابو, ألغاز, تخمين الشخصيات, اختر مغامرتك, أكمل القصة, خمّن من الإيموجي, حقيقتان وكذبة, لو خيروك, مسابقة الثقافة, صح أم خطأ, سلسلة الكلمات, and إكس أو. It keeps the game state (and its secret answers) server-side, tracks the score, and remembers your all-time record across threads.
+
 ---
 
 ## How to use it
@@ -175,6 +178,7 @@ Reliability notes:
 | `EXTRACTION_THINKING_LEVEL`     | `low`                      | Thinking level for extraction/FAQ/rewrite (hot via panel). |
 | `MEDIA_RESOLUTION`              | — (model default)          | `low`/`medium`/`high` media token budget (restart).    |
 | `SEARCH_GROUNDING_ENABLED`      | `false`                    | Google Search grounding; replaces the custom web_search when on. Billed per executed query past the free allowance (hot via panel). |
+| `GAMES_ENABLED`                 | `true`                     | Gaming mode: the bot hosts 15 text games (hangman, 20 questions, trivia, ...) with per-thread state and all-time player scores (hot via panel). |
 | `USER_FACT_SUPERSEDE_THRESHOLD` | `0.78`                     | Similarity at which a new fact supersedes an old one.  |
 | `FORGET_SIMILARITY_THRESHOLD`   | `0.75`                     | Similarity for locating facts a user asked to forget.  |
 | `APP_KNOWLEDGE_LIMIT`           | `3`                        | Max app-knowledge facts injected into a prompt.        |

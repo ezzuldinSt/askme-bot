@@ -129,6 +129,9 @@ pub struct ConfigOverrides {
     /// when on). Billed per executed search query past the free allowance —
     /// default OFF.
     pub search_grounding_enabled: Option<bool>,
+    /// Gaming mode: the bot hosts text games (hangman, 20 questions, ...)
+    /// when users ask to play. Default ON.
+    pub games_enabled: Option<bool>,
     /// Max bytes web_fetch downloads per URL.
     pub web_fetch_max_bytes: Option<usize>,
     /// Per-request timeout for web_fetch, in seconds.
@@ -328,6 +331,9 @@ pub struct ToolsConfig {
     /// not declared. Default false (bills per executed query past the free
     /// allowance).
     pub search_grounding_enabled: bool,
+    /// Gaming mode: host text games when users ask to play (manage_game tool
+    /// + per-thread game state). Default true.
+    pub games_enabled: bool,
     /// Max key-failover attempts per reply flow (each arm re-runs the flow).
     pub max_flow_attempts: usize,
 }
@@ -431,6 +437,11 @@ impl RuntimeConfig {
                     std::env::var("SEARCH_GROUNDING_ENABLED")
                         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
                         .unwrap_or(false)
+                }),
+                games_enabled: overrides.games_enabled.unwrap_or_else(|| {
+                    std::env::var("GAMES_ENABLED")
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+                        .unwrap_or(true)
                 }),
                 max_flow_attempts: overrides
                     .max_flow_attempts

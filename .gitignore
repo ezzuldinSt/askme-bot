@@ -9,6 +9,9 @@ output.log
 bot_config.json
 bot_config.json.bak
 
+# Gaming mode state (per-instance data written by the bot)
+game_states.json
+
 # Support FAQ store (per-instance data written by the admin panel)
 support_faqs.json
 

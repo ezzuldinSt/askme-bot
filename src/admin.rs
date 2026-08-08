@@ -464,6 +464,7 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
                 "user_scan_fact_cap": resolved.tools.user_scan_fact_cap,
                 "url_context_enabled": resolved.tools.url_context_enabled,
                 "search_grounding_enabled": resolved.tools.search_grounding_enabled,
+                "games_enabled": resolved.tools.games_enabled,
             },
         },
         "overridden": {
@@ -517,6 +518,7 @@ struct ConfigUpdate {
     user_scan_fact_cap: usize,
     url_context_enabled: bool,
     search_grounding_enabled: bool,
+    games_enabled: bool,
     // Hot-applied (empty/None = leave unchanged).
     gemini_api_keys: Option<Vec<String>>,
     /// Appended to the current pool (deduped). Ignored when gemini_api_keys
@@ -668,6 +670,7 @@ async fn put_config(
     o.user_scan_fact_cap = Some(req.user_scan_fact_cap);
     o.url_context_enabled = Some(req.url_context_enabled);
     o.search_grounding_enabled = Some(req.search_grounding_enabled);
+    o.games_enabled = Some(req.games_enabled);
 
     // Key pool: empty/None = unchanged; otherwise replace wholesale (min 1).
     // Replace wins over append when both are filled.

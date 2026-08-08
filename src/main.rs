@@ -2,6 +2,7 @@ mod admin;
 mod config;
 mod entities;
 mod faqs;
+mod games;
 mod gemini_client;
 mod models;
 mod qdrant_client;
@@ -24,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::RuntimeConfig;
 use crate::entities::build_reply_with_entities;
+use crate::games::GameStore;
 use crate::gemini_client::{
     is_transient_exhausted, GeminiClient, GeminiError, GenerateTurn, KeyLease,
 };
@@ -100,6 +102,9 @@ struct AppState {
     processed: HashSet<u64>,
     /// Per-notification failure counters for the current session.
     failures: HashMap<u64, u8>,
+    /// Gaming mode: per-thread game states + all-time per-user scores.
+    /// Shared with each flow's ToolContext (the manage_game tool writes it).
+    games: Arc<Mutex<GameStore>>,
 }
 
 /// Result of attempting to handle one notification.
@@ -302,6 +307,7 @@ async fn main() -> Result<()> {
         system_prompt,
         processed,
         failures: HashMap::new(),
+        games: Arc::new(Mutex::new(GameStore::load())),
     }));
 
     if args.iter().any(|a| a == "--test-post") {
@@ -556,7 +562,8 @@ async fn test_post(
                 build_follow_up_prompt(state, post, &question, &post_data, conversation_id, Some(&meter))
                     .await
             } else {
-                build_mention_prompt(state, post, &question, &ancestors, Some(&meter)).await
+                build_mention_prompt(state, post, &question, &ancestors, conversation_id, Some(&meter))
+                    .await
             }
         }
     };
@@ -573,6 +580,10 @@ async fn test_post(
             s.extraction_writer.clone(),
             flow_subjects,
             meter.clone(),
+            crate::tools::GameHooks {
+                store: s.games.clone(),
+                conversation_id,
+            },
         )
     };
     println!(
@@ -1328,7 +1339,8 @@ async fn process_notification(
         build_follow_up_prompt(&state, &post, &question, &post_data, conversation_id, Some(&meter))
             .await
     } else {
-        build_mention_prompt(&state, &post, &question, &ancestors, Some(&meter)).await
+        build_mention_prompt(&state, &post, &question, &ancestors, conversation_id, Some(&meter))
+            .await
     };
 
     info!(
@@ -1349,6 +1361,10 @@ async fn process_notification(
             s.extraction_writer.clone(),
             flow_subjects,
             meter.clone(),
+            crate::tools::GameHooks {
+                store: s.games.clone(),
+                conversation_id,
+            },
         )
     };
 
@@ -1504,7 +1520,14 @@ async fn process_notification(
         let cfg = runtime.read().await;
         cfg.memory.extraction_min_chars
     };
-    if !is_empty_mention && passes_extraction_gate(&question, extraction_min_chars) {
+    // Threads with an active game skip extraction: game chatter ("the word
+    // was شمس", "your turn") would pollute long-term memory.
+    let game_active = {
+        let games = state.read().await.games.clone();
+        let active = games.lock().unwrap().has_active_game(conversation_id);
+        active
+    };
+    if !is_empty_mention && !game_active && passes_extraction_gate(&question, extraction_min_chars) {
         let _ = state
             .read()
             .await
@@ -1705,11 +1728,29 @@ fn music_note(post: &Post) -> String {
     }
 }
 
+/// Gaming mode: the `[Active game: ...]` section pinning the thread's live
+/// game state (the secret is included for the model, marked never-reveal)
+/// plus the player's all-time record. Empty when no game is active in the
+/// thread or gaming mode is disabled.
+async fn build_game_section(state: &RwLock<AppState>, conversation_id: u64) -> String {
+    let games = {
+        let s = state.read().await;
+        let runtime = s.runtime.clone();
+        if !runtime.read().await.tools.games_enabled {
+            return String::new();
+        }
+        s.games.clone()
+    };
+    let section = games.lock().unwrap().prompt_section(conversation_id);
+    section.unwrap_or_default()
+}
+
 async fn build_mention_prompt(
     state: &RwLock<AppState>,
     post: &Post,
     question: &str,
     ancestors: &[(String, String)],
+    conversation_id: u64,
     meter: Option<&FlowMeter>,
 ) -> String {
     let author = post.author_username();
@@ -1722,9 +1763,10 @@ async fn build_mention_prompt(
 
     let profile = build_user_profile_section(state, author).await;
     let app_knowledge = build_app_knowledge_section(state, question, meter).await;
+    let game = build_game_section(state, conversation_id).await;
 
     format!(
-        "[Post by {author}] {content}\n[Question] {question}{music}{above}{profile}{app_knowledge}",
+        "[Post by {author}] {content}\n[Question] {question}{music}{above}{profile}{app_knowledge}{game}",
         content = post.content_text(),
         question = question,
         author = author,
@@ -1732,6 +1774,7 @@ async fn build_mention_prompt(
         above = above,
         profile = profile,
         app_knowledge = app_knowledge,
+        game = game,
     )
 }
 
@@ -1769,6 +1812,7 @@ async fn build_greeting_prompt(
         format_ancestor_chain(ancestors, depth_limit)
     };
 
+    let game = build_game_section(state, conversation_id).await;
     format!(
         "The user @{author} mentioned you without any question text{}. \
          Reply with a short, warm greeting in ARABIC (1-2 sentences, no hashtags). \
@@ -1785,7 +1829,7 @@ async fn build_greeting_prompt(
         } else {
             ""
         },
-    ) + &music_note(post) + &context
+    ) + &music_note(post) + &context + &game
 }
 
 /// Render the thread above a mention as prompt context, oldest first (the same
@@ -1971,15 +2015,17 @@ async fn build_follow_up_prompt(
 
     let profile = build_user_profile_section(state, author).await;
     let app_knowledge = build_app_knowledge_section(state, question, meter).await;
+    let game = build_game_section(state, conversation_id).await;
 
     format!(
-        "[Follow-up question by {author}] {question}{music}{context}{profile}{app_knowledge}",
+        "[Follow-up question by {author}] {question}{music}{context}{profile}{app_knowledge}{game}",
         author = author,
         question = question,
         music = music_note(post),
         context = context,
         profile = profile,
         app_knowledge = app_knowledge,
+        game = game,
     )
 }
 
@@ -2622,6 +2668,7 @@ fn flow_attempt_cap(pool_size: usize, configured: usize) -> usize {
 /// scaffold text instead of answering — that must never be posted verbatim.
 const SCAFFOLD_LEAK_MARKERS: &[&str] = &[
     "[About ",
+    "[Active game",
     "[Attached music",
     "[Briefing for",
     "[Conversation so far]",
@@ -2824,12 +2871,19 @@ async fn generate_with_tools_failover(
             },
         }];
 
-        let (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled) = {
+        let (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled, games_enabled) = {
             let tools_enabled = tool_ctx.tools_enabled().await;
             let max_rounds = tool_ctx.max_tool_rounds().await;
             let url_context_enabled = tool_ctx.url_context_enabled().await;
             let search_grounding_enabled = tool_ctx.search_grounding_enabled().await;
-            (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled)
+            let games_enabled = tool_ctx.games_enabled().await;
+            (
+                tools_enabled,
+                max_rounds,
+                url_context_enabled,
+                search_grounding_enabled,
+                games_enabled,
+            )
         };
 
         match run_tool_rounds(
@@ -2842,6 +2896,7 @@ async fn generate_with_tools_failover(
             max_rounds,
             url_context_enabled,
             search_grounding_enabled,
+            games_enabled,
         )
         .await
         {
@@ -2880,9 +2935,10 @@ async fn run_tool_rounds(
     max_rounds: usize,
     url_context_enabled: bool,
     search_grounding_enabled: bool,
+    games_enabled: bool,
 ) -> Result<(String, ReplySources), ToolsFlowError> {
     let declarations = if tools_enabled {
-        tool_declarations(url_context_enabled, search_grounding_enabled)
+        tool_declarations(url_context_enabled, search_grounding_enabled, games_enabled)
     } else {
         Vec::new()
     };
@@ -3876,6 +3932,7 @@ mod tests {
                 user_scan_fact_cap: 3,
                 url_context_enabled: true,
                 search_grounding_enabled: false,
+                games_enabled: true,
                 max_flow_attempts: 3,
             },
         }));
@@ -3891,6 +3948,7 @@ mod tests {
             system_prompt: String::new(),
             processed: HashSet::new(),
             failures: HashMap::new(),
+            games: Arc::new(Mutex::new(GameStore::default())),
         }))
     }
 
@@ -3971,6 +4029,10 @@ mod tests {
     use crate::models::{FunctionCallData, ToolCallData, ToolResponseData};
 
     fn test_tool_ctx() -> ToolContext {
+        test_tool_ctx_with_games(Arc::new(Mutex::new(GameStore::default())))
+    }
+
+    fn test_tool_ctx_with_games(games: Arc<Mutex<GameStore>>) -> ToolContext {
         let gemini = GeminiClient::new("test-key".to_string());
         let qdrant = Arc::new(QdrantClient::unavailable(Arc::new(gemini), 4));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -3997,12 +4059,17 @@ mod tests {
                     user_scan_fact_cap: 3,
                     url_context_enabled: true,
                     search_grounding_enabled: false,
+                    games_enabled: true,
                     max_flow_attempts: 3,
                 },
             })),
             tx,
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(FlowMeter::default()),
+            crate::tools::GameHooks {
+                store: games,
+                conversation_id: 7,
+            },
         )
     }
 
@@ -4026,6 +4093,61 @@ mod tests {
             }],
             finish_reason: Some("STOP".to_string()),
         }
+    }
+
+    /// The manage_game tool persists state through the store and credits
+    /// all-time scores on end.
+    #[tokio::test]
+    async fn manage_game_start_update_end_scores() {
+        let games = Arc::new(Mutex::new(GameStore::default()));
+        let ctx = test_tool_ctx_with_games(games.clone());
+
+        let r = ctx
+            .execute(
+                "manage_game",
+                &json!({"action": "start", "game": "hangman", "player": "sara", "secret": "شمس", "state": {"wrong": 0}}),
+            )
+            .await;
+        assert_eq!(r["ok"], json!(true));
+        {
+            let mut s = games.lock().unwrap();
+            let g = s.active_game(7).expect("game registered for the flow's conversation");
+            assert_eq!(g.game, "hangman");
+            assert_eq!(g.secret.as_deref(), Some("شمس"));
+        }
+
+        let r = ctx
+            .execute("manage_game", &json!({"action": "update", "state": {"wrong": 1}}))
+            .await;
+        assert_eq!(r["turn"], json!(2), "absent turn increments");
+
+        let r = ctx
+            .execute("manage_game", &json!({"action": "end", "result": "win"}))
+            .await;
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["player_record"]["wins"], json!(1));
+        assert!(games.lock().unwrap().active_game(7).is_none(), "game ended");
+
+        // Unknown game names are rejected with the valid list.
+        let r = ctx
+            .execute("manage_game", &json!({"action": "start", "game": "poker", "player": "sara"}))
+            .await;
+        assert!(r["error"].as_str().unwrap().contains("hangman"));
+    }
+
+    /// The [Active game] prompt section appears only while a game is live.
+    #[tokio::test]
+    async fn game_section_appears_only_with_active_game() {
+        let state = test_state();
+        assert!(build_game_section(&state, 7).await.is_empty());
+        let games = state.read().await.games.clone();
+        games
+            .lock()
+            .unwrap()
+            .start_game(7, "trivia", "sara", None, json!({"q": 1}));
+        let section = build_game_section(&state, 7).await;
+        assert!(section.contains("[Active game: مسابقة الثقافة"));
+        assert!(section.contains("turn 1"));
     }
 
     /// Bug #1: a turn of only server-side tool parts (no function calls) must

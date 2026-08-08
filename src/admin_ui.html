@@ -389,6 +389,9 @@
           <div class="row"><span class="k">Google Search grounding</span>
             <span class="toggle"><input id="cfg-search_grounding_enabled" type="checkbox"><span class="track"></span><span class="thumb"></span></span></div>
           <div class="hint" style="margin-top:6px;">Gemini searches Google server-side and answers in one turn (replaces the custom web_search tool). Billed per executed search query past the free allowance (~500 req/day per key, then $14/1k queries).</div>
+          <div class="row"><span class="k">Gaming mode</span>
+            <span class="toggle"><input id="cfg-games_enabled" type="checkbox"><span class="track"></span><span class="thumb"></span></span></div>
+          <div class="hint" style="margin-top:6px;">The bot hosts text games (hangman, 20 questions, trivia, إكس أو, ...) when users ask to play. Per-thread state + all-time player scores are kept in game_states.json.</div>
           <div class="field"><label>Max tool rounds <span class="hint">API calls per reply (1-8)</span></label>
             <input id="cfg-max_tool_rounds" type="number" min="1" max="8"></div>
           <div class="field"><label>Max flow attempts <span class="hint">key-failover re-runs per reply (1-8); each re-runs the whole flow</span></label>
@@ -687,6 +690,7 @@ async function loadConfig() {
     $('cfg-tools_enabled').checked = d.hot.tools.enabled;
     $('cfg-url_context_enabled').checked = d.hot.tools.url_context_enabled;
     $('cfg-search_grounding_enabled').checked = d.hot.tools.search_grounding_enabled;
+    $('cfg-games_enabled').checked = d.hot.tools.games_enabled;
     $('cfg-thinking_level').value = d.hot.thinking_level ?? 'default';
     $('cfg-extraction_thinking_level').value = d.hot.extraction_thinking_level || 'default';
     $('cfg-gemini_api_keys').value = '';
@@ -710,7 +714,7 @@ async function loadConfig() {
 }
 $('config-reload').onclick = loadConfig;
 $('config-save').onclick = async () => {
-  const body = { fact_extraction_enabled: $('cfg-fact_extraction_enabled').checked, tools_enabled: $('cfg-tools_enabled').checked, url_context_enabled: $('cfg-url_context_enabled').checked, search_grounding_enabled: $('cfg-search_grounding_enabled').checked };
+  const body = { fact_extraction_enabled: $('cfg-fact_extraction_enabled').checked, tools_enabled: $('cfg-tools_enabled').checked, url_context_enabled: $('cfg-url_context_enabled').checked, search_grounding_enabled: $('cfg-search_grounding_enabled').checked, games_enabled: $('cfg-games_enabled').checked };
   for (const f of HOT_FIELDS) {
     if (f === 'generation_model') { body[f] = $(`cfg-${f}`).value; continue; }
     body[f] = f.includes('threshold') || f.includes('score') ? parseFloat($(`cfg-${f}`).value) : parseInt($(`cfg-${f}`).value, 10);
