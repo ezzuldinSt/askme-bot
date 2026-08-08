@@ -2547,34 +2547,66 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     }
 }
 
-/// Append a "Sources:" footer listing the URLs the model fetched via the
-/// url_context tool. Deduped, capped, and skipped when empty. URLs stay plain
-/// text — Things auto-links them in the rendered post.
-fn append_sources_footer(text: &str, sources: &[String]) -> String {
+/// What one reply flow grounded its answer on: the URLs the url_context tool
+/// fetched plus the source names the google_search tool used.
+#[derive(Debug, Default, Clone)]
+pub struct ReplySources {
+    /// Plain URLs from url_context (Things auto-links them in the post).
+    pub urls: Vec<String>,
+    /// Source names from Google Search grounding chunks. The chunk URIs are
+    /// vertexaisearch redirect URLs — never posted; only the titles.
+    pub titles: Vec<String>,
+}
+
+impl ReplySources {
+    /// Fold one model turn's grounding into the flow's sources. url_context
+    /// URLs accumulate raw (the footer dedups); grounding titles dedup
+    /// case-insensitively on the way in.
+    fn absorb(&mut self, turn: &GenerateTurn) {
+        self.urls.extend(turn.retrieved_urls.iter().cloned());
+        for title in &turn.grounded_sources {
+            if !self.titles.iter().any(|t| t.eq_ignore_ascii_case(title)) {
+                self.titles.push(title.clone());
+            }
+        }
+    }
+}
+
+/// Append a "Sources:" footer: url_context URLs (auto-linked by Things) then
+/// Google Search grounding source names (plain text). Deduped, capped, and
+/// skipped when both are empty.
+fn append_sources_footer(text: &str, sources: &ReplySources) -> String {
     const MAX_SOURCES: usize = 5;
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut urls: Vec<&str> = Vec::new();
-    for url in sources {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    for url in &sources.urls {
         let url = url.trim();
         if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
             continue;
         }
-        if seen.insert(url) {
-            urls.push(url);
-            if urls.len() >= MAX_SOURCES {
-                break;
-            }
+        if seen.insert(url.to_string()) {
+            lines.push(url.to_string());
         }
     }
-    if urls.is_empty() {
+    for title in &sources.titles {
+        let title = title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        if seen.insert(title.to_lowercase()) {
+            lines.push(title.to_string());
+        }
+    }
+    lines.truncate(MAX_SOURCES);
+    if lines.is_empty() {
         return text.to_string();
     }
-    let mut out = String::with_capacity(text.len() + 96 + urls.len() * 64);
+    let mut out = String::with_capacity(text.len() + 96 + lines.len() * 64);
     out.push_str(text);
     out.push_str("\n\nSources:");
-    for url in urls {
+    for line in &lines {
         out.push('\n');
-        out.push_str(url);
+        out.push_str(line);
     }
     out
 }
@@ -2722,7 +2754,7 @@ async fn generate_with_tools_failover(
     user_text: &str,
     media_files: &[DownloadedMedia],
     tool_ctx: &ToolContext,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(String, ReplySources)> {
     // Key-failover arms: each re-runs the whole flow (rounds + uploads), so
     // an uncapped pool (16 keys) could multiply one reply's cost by 16 in a
     // 429 storm. A small cap degrades to "retry next poll" instead.
@@ -2792,11 +2824,12 @@ async fn generate_with_tools_failover(
             },
         }];
 
-        let (tools_enabled, max_rounds, url_context_enabled) = {
+        let (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled) = {
             let tools_enabled = tool_ctx.tools_enabled().await;
             let max_rounds = tool_ctx.max_tool_rounds().await;
             let url_context_enabled = tool_ctx.url_context_enabled().await;
-            (tools_enabled, max_rounds, url_context_enabled)
+            let search_grounding_enabled = tool_ctx.search_grounding_enabled().await;
+            (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled)
         };
 
         match run_tool_rounds(
@@ -2808,6 +2841,7 @@ async fn generate_with_tools_failover(
             tools_enabled,
             max_rounds,
             url_context_enabled,
+            search_grounding_enabled,
         )
         .await
         {
@@ -2834,7 +2868,8 @@ async fn generate_with_tools_failover(
 /// The tool-calling loop on one lease: ask the model for a turn, execute any
 /// function calls it requests, feed the results back, repeat until it produces
 /// final text or the round budget is exhausted. Returns the final text plus
-/// every URL the model fetched via the url_context tool across the rounds.
+/// everything the model grounded the answer on across the rounds (url_context
+/// URLs and google_search source names).
 async fn run_tool_rounds(
     gemini: &GeminiClient,
     lease: &KeyLease,
@@ -2844,9 +2879,10 @@ async fn run_tool_rounds(
     tools_enabled: bool,
     max_rounds: usize,
     url_context_enabled: bool,
-) -> Result<(String, Vec<String>), ToolsFlowError> {
+    search_grounding_enabled: bool,
+) -> Result<(String, ReplySources), ToolsFlowError> {
     let declarations = if tools_enabled {
-        tool_declarations(url_context_enabled)
+        tool_declarations(url_context_enabled, search_grounding_enabled)
     } else {
         Vec::new()
     };
@@ -2856,7 +2892,7 @@ async fn run_tool_rounds(
     // instead of re-executing and re-echoing a large result into the history.
     // get_current_time is never cached (it must stay fresh).
     let mut call_cache: HashMap<String, Value> = HashMap::new();
-    let mut sources: Vec<String> = Vec::new();
+    let mut sources = ReplySources::default();
 
     for _ in 0..max_rounds {
         tool_ctx.meter.gen();
@@ -2868,7 +2904,12 @@ async fn run_tool_rounds(
             Err(GeminiError::RateLimited) => return Err(ToolsFlowError::RateLimited),
             Err(GeminiError::Failed(e)) => return Err(ToolsFlowError::Failed(e)),
         };
-        sources.extend(turn.retrieved_urls.clone());
+        // Gemini 3 bills grounding PER EXECUTED QUERY — log them for cost
+        // visibility.
+        if !turn.grounded_queries.is_empty() {
+            info!("google_search queries this turn: {:?}", turn.grounded_queries);
+        }
+        sources.absorb(&turn);
 
         if turn.function_calls.is_empty() {
             match turn.text {
@@ -2916,6 +2957,7 @@ async fn run_tool_rounds(
         Err(GeminiError::RateLimited) => return Err(ToolsFlowError::RateLimited),
         Err(GeminiError::Failed(e)) => return Err(ToolsFlowError::Failed(e)),
     };
+    sources.absorb(&final_turn);
     if final_turn.function_calls.is_empty() {
         if let Some(text) = final_turn.text {
             return Ok((text, sources));
@@ -3371,25 +3413,51 @@ mod tests {
         assert_eq!(strip_mention("email askme@example.com"), "email askme@example.com");
     }
 
+    fn urls_only(urls: Vec<String>) -> ReplySources {
+        ReplySources { urls, titles: vec![] }
+    }
+
     #[test]
     fn sources_footer_appends_deduped_capped_urls() {
-        assert_eq!(append_sources_footer("answer", &[]), "answer");
+        assert_eq!(append_sources_footer("answer", &ReplySources::default()), "answer");
         assert_eq!(
-            append_sources_footer("answer", &["https://a.example".to_string()]),
+            append_sources_footer("answer", &urls_only(vec!["https://a.example".to_string()])),
             "answer\n\nSources:\nhttps://a.example"
         );
-        let dupes = vec![
+        let dupes = urls_only(vec![
             "https://a.example".to_string(),
             "https://a.example".to_string(),
             "https://b.example".to_string(),
-        ];
+        ]);
         let out = append_sources_footer("answer", &dupes);
         assert!(out.matches("https://a.example").count() == 1);
         assert!(out.contains("https://b.example"));
 
-        let many: Vec<String> = (0..9).map(|i| format!("https://s{i}.example")).collect();
+        let many = urls_only((0..9).map(|i| format!("https://s{i}.example")).collect());
         assert_eq!(append_sources_footer("a", &many).lines().count(), 8, "1 text + 1 blank + 1 header + 5 urls");
         assert!(!append_sources_footer("a", &many).contains("https://s5.example"));
+    }
+
+    #[test]
+    fn sources_footer_includes_grounding_titles() {
+        let sources = ReplySources {
+            urls: vec!["https://a.example".to_string()],
+            titles: vec![
+                "aljazeera.com".to_string(),
+                "ALJAZEERA.COM".to_string(),
+                "uefa.com".to_string(),
+            ],
+        };
+        let out = append_sources_footer("answer", &sources);
+        assert!(out.contains("https://a.example"));
+        assert_eq!(out.matches("aljazeera.com").count(), 1, "titles dedup case-insensitively");
+        assert!(out.contains("uefa.com"));
+        // Titles alone still produce a footer.
+        let titles_only = ReplySources { urls: vec![], titles: vec!["bbc.com".to_string()] };
+        assert_eq!(append_sources_footer("a", &titles_only), "a\n\nSources:\nbbc.com");
+        // Blank titles are skipped.
+        let blank = ReplySources { urls: vec![], titles: vec!["  ".to_string()] };
+        assert_eq!(append_sources_footer("a", &blank), "a");
     }
 
     #[test]
@@ -3485,9 +3553,11 @@ mod tests {
         // a huge model answer with a full Sources footer.
         const { assert!(MAX_RESPONSE_LENGTH < 2000) };
         let long = "**Riyadh** ".repeat(500); // ~5500 chars of bold markup
-        let sources: Vec<String> = (0..5)
-            .map(|i| format!("https://source-{i}.example/very/long/url/path"))
-            .collect();
+        let sources = urls_only(
+            (0..5)
+                .map(|i| format!("https://source-{i}.example/very/long/url/path"))
+                .collect(),
+        );
         let combined = append_sources_footer(&long, &sources);
         let (text, entities) = build_reply_with_entities(&combined, MAX_RESPONSE_LENGTH);
         assert!(text.chars().count() <= 2000);
@@ -3501,7 +3571,10 @@ mod tests {
     #[test]
     fn sources_footer_skips_invalid_urls() {
         assert_eq!(
-            append_sources_footer("a", &["not-a-url".to_string(), "".to_string(), "ftp://x".to_string()]),
+            append_sources_footer(
+                "a",
+                &urls_only(vec!["not-a-url".to_string(), "".to_string(), "ftp://x".to_string()])
+            ),
             "a"
         );
     }
@@ -3802,6 +3875,7 @@ mod tests {
                 user_scan_posts_limit: 10,
                 user_scan_fact_cap: 3,
                 url_context_enabled: true,
+                search_grounding_enabled: false,
                 max_flow_attempts: 3,
             },
         }));
@@ -3922,6 +3996,7 @@ mod tests {
                     user_scan_posts_limit: 10,
                     user_scan_fact_cap: 3,
                     url_context_enabled: true,
+                    search_grounding_enabled: false,
                     max_flow_attempts: 3,
                 },
             })),
@@ -3939,6 +4014,8 @@ mod tests {
                 args: json!({ "username": "khalid" }),
             }],
             retrieved_urls: vec![],
+            grounded_sources: vec![],
+            grounded_queries: vec![],
             raw_parts: vec![Part::FunctionCall {
                 function_call: FunctionCallData {
                     name: "get_user_facts".to_string(),
@@ -3960,6 +4037,8 @@ mod tests {
             text: None,
             function_calls: vec![],
             retrieved_urls: vec![],
+            grounded_sources: vec![],
+            grounded_queries: vec![],
             raw_parts: vec![
                 Part::ToolCall {
                     tool_call: ToolCallData {

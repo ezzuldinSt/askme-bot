@@ -128,6 +128,13 @@ pub struct GenerateTurn {
     /// URLs the URL context tool successfully fetched this turn (the answer
     /// may be based on them; the reply flow appends them as a Sources footer).
     pub retrieved_urls: Vec<String>,
+    /// Source names from Google Search grounding chunks this turn (the chunk
+    /// URIs are Google redirect URLs — only the titles are presentable, so
+    /// only titles are collected here).
+    pub grounded_sources: Vec<String>,
+    /// Queries the google_search tool executed this turn. Gemini 3 bills
+    /// grounding PER QUERY, so the reply flow logs these for cost visibility.
+    pub grounded_queries: Vec<String>,
     /// Every part of the candidate's model-role content, re-serialized for
     /// circulation into the next request. MUST include toolCall/toolResponse
     /// and all thought signatures when tool context circulation is active.
@@ -172,6 +179,27 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let (grounded_sources, grounded_queries) = match candidate.grounding_metadata.as_ref() {
+        Some(g) => {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let sources = g
+                .grounding_chunks
+                .as_ref()
+                .map(|chunks| {
+                    chunks
+                        .iter()
+                        .filter_map(|c| c.web.as_ref())
+                        .filter_map(|w| w.title.clone())
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let queries = g.web_search_queries.clone().unwrap_or_default();
+            (sources, queries)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     let parts = candidate.content.and_then(|c| c.parts).unwrap_or_default();
 
     let mut text = String::new();
@@ -242,6 +270,8 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
             text: (!text.trim().is_empty()).then_some(text),
             function_calls,
             retrieved_urls,
+            grounded_sources,
+            grounded_queries,
             raw_parts,
             finish_reason,
         });
@@ -251,12 +281,15 @@ fn parse_turn(response: GenerateContentResponse) -> Result<GenerateTurn, Attempt
         text: (!text.trim().is_empty()).then_some(text),
         function_calls,
         retrieved_urls,
+        grounded_sources,
+        grounded_queries,
         raw_parts,
         finish_reason,
     })
 }
 
 /// How a single API attempt failed (internal classification).
+#[derive(Debug)]
 enum AttemptFailure {
     /// 429 — cool the key down (or park it for the day).
     RateLimited { retry_after: Duration, daily: bool },
@@ -353,7 +386,7 @@ impl GeminiClient {
                 api_keys.len()
             );
         }
-        Self {
+        let client = Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
                 .build()
@@ -371,7 +404,9 @@ impl GeminiClient {
             embedding_dimensions,
             embedding_batch_size,
             embed_cache: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        client.warn_on_unsupported_thinking_level();
+        client
     }
 
     /// Hot-swap the chat model (propagates to every clone of this client).
@@ -381,6 +416,8 @@ impl GeminiClient {
             info!("Generation model changed: {} -> {model}", *current);
             *current = model;
         }
+        drop(current);
+        self.warn_on_unsupported_thinking_level();
     }
 
     /// The currently active chat model.
@@ -395,6 +432,8 @@ impl GeminiClient {
             info!("Extraction model changed: {:?} -> {:?}", *current, model);
             *current = model;
         }
+        drop(current);
+        self.warn_on_unsupported_thinking_level();
     }
 
     /// The effective extraction model: the override when set, else the chat model.
@@ -413,6 +452,8 @@ impl GeminiClient {
             info!("Thinking level changed: {:?} -> {:?}", *current, level);
             *current = level;
         }
+        drop(current);
+        self.warn_on_unsupported_thinking_level();
     }
 
     /// The currently configured thinking level (None = model default).
@@ -426,6 +467,28 @@ impl GeminiClient {
         if *current != level {
             info!("Extraction thinking level changed: {:?} -> {:?}", *current, level);
             *current = level;
+        }
+        drop(current);
+        self.warn_on_unsupported_thinking_level();
+    }
+
+    /// Warn once when an active thinking level is unsupported by its model
+    /// (Thinking docs' per-model matrix). The request path also silently
+    /// drops such levels, so the misconfiguration degrades to the model
+    /// default instead of 400ing every call.
+    fn warn_on_unsupported_thinking_level(&self) {
+        for (model, level) in [
+            (self.generation_model(), self.thinking_level()),
+            (self.extraction_model(), self.extraction_thinking_level()),
+        ] {
+            if let Some(level) = level {
+                if !thinking_level_supported(&model, &level) {
+                    warn!(
+                        "Thinking level {level:?} is not supported by {model}; \
+                         requests will use the model default instead"
+                    );
+                }
+            }
         }
     }
 
@@ -451,6 +514,17 @@ impl GeminiClient {
         } else {
             self.thinking_level.read().unwrap().clone()
         };
+        // Drop a level the active model doesn't support (Thinking docs'
+        // per-model matrix): sending it would 400 every request. None = the
+        // model default, which is always safe. The setters warn once per
+        // change, so this filter stays silent.
+        let model = if extraction {
+            self.extraction_model()
+        } else {
+            self.generation_model()
+        };
+        let thinking_level =
+            thinking_level.filter(|level| thinking_level_supported(&model, level));
         let media_resolution = media.then(|| self.media_resolution.clone()).flatten();
         if response_mime_type.is_none()
             && response_schema.is_none()
@@ -1090,11 +1164,14 @@ impl GeminiClient {
         })?;
 
         // Token accounting per call (Thinking docs: billed output = candidates
-        // + thoughts) — visibility into what each reply/extraction costs.
+        // + thoughts) — visibility into what each reply/extraction costs. The
+        // cached count shows implicit context-cache hits (on by default for
+        // Gemini 2.5+; a stable request prefix above the model's minimum).
         if let Some(u) = &response.usageMetadata {
             info!(
-                "Gemini {model} usage: {} prompt + {} candidates + {} thoughts = {} tokens",
+                "Gemini {model} usage: {} prompt ({} cached) + {} candidates + {} thoughts = {} tokens",
                 u.promptTokenCount.unwrap_or(0),
+                u.cachedContentTokenCount.unwrap_or(0),
                 u.candidatesTokenCount.unwrap_or(0),
                 u.thoughtsTokenCount.unwrap_or(0),
                 u.totalTokenCount.unwrap_or(0),
@@ -1261,12 +1338,12 @@ impl GeminiClient {
 }
 
 /// Server-side tool context circulation must be enabled whenever the request
-/// declares a built-in tool (url_context) OR the outgoing history already
-/// carries server-side toolCall/toolResponse parts — otherwise the API
-/// rejects the echo with 400 INVALID_ARGUMENT. The second case covers the
-/// final no-tools answer call after a run of tool rounds.
+/// declares a built-in tool (url_context, google_search) OR the outgoing
+/// history already carries server-side toolCall/toolResponse parts — otherwise
+/// the API rejects the echo with 400 INVALID_ARGUMENT. The second case covers
+/// the final no-tools answer call after a run of tool rounds.
 fn needs_tool_config(tools: &[Tool], contents: &[Content]) -> bool {
-    tools.iter().any(|t| t.url_context.is_some())
+    tools.iter().any(|t| t.url_context.is_some() || t.google_search.is_some())
         || contents.iter().any(|c| {
             c.parts
                 .iter()
@@ -1274,8 +1351,36 @@ fn needs_tool_config(tools: &[Tool], contents: &[Content]) -> bool {
         })
 }
 
+/// Exponential backoff (1s/2s/4s/8s cap) with ±25% jitter — the
+/// Troubleshooting docs recommend jitter so concurrent workers/keys don't
+/// retry in lockstep. The jitter seed comes from a UUID: no RNG dependency.
 fn backoff(transient_retries: u32) -> Duration {
-    Duration::from_millis(1000 * (1u64 << transient_retries.saturating_sub(1).min(3)))
+    let base_ms = 1000 * (1u64 << transient_retries.saturating_sub(1).min(3));
+    let spread = base_ms / 4;
+    let seed = u64::from(uuid::Uuid::new_v4().as_bytes()[0]); // 0..=255
+    Duration::from_millis(base_ms - spread + (seed * spread * 2 / 255))
+}
+
+/// Per-model thinking-level support (Thinking docs matrix). Only models with
+/// RESTRICTED level sets are listed; anything unrecognized is assumed to
+/// accept every level, so newly released models are never blocked.
+fn thinking_level_supported(model: &str, level: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let restricted: Option<&[&str]> = if name.starts_with("gemini-3-pro-preview") {
+        Some(&["low", "high"])
+    } else if name.starts_with("gemini-3.1-pro-preview") {
+        Some(&["low", "medium", "high"])
+    } else if name.starts_with("gemini-3.1-flash-lite-image") {
+        Some(&["minimal", "high"])
+    } else if name.starts_with("gemini-2.5") {
+        Some(&["low", "medium", "high"])
+    } else {
+        None
+    };
+    match restricted {
+        Some(levels) => levels.contains(&level),
+        None => true,
+    }
 }
 
 fn collect_embeddings(
@@ -1316,6 +1421,14 @@ fn classify_http_failure(status: StatusCode, body: &[u8]) -> AttemptFailure {
         return AttemptFailure::RateLimited { retry_after, daily };
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        // Google proactively blocks keys identified as leaked (Troubleshooting
+        // docs) — fail over, but make the log actionable: rotating to another
+        // EXISTING key won't help; the operator must mint a new one.
+        if text.contains("reported as leaked") {
+            return AttemptFailure::Dead(format!(
+                "HTTP {status}: key reported as leaked — generate a NEW key in Google AI Studio"
+            ));
+        }
         return AttemptFailure::Dead(format!("HTTP {status}: {}", truncate(&text, 200)));
     }
     // Google's INVALID_ARGUMENT for a bad key comes back as HTTP 400, not 401.
@@ -1328,7 +1441,8 @@ fn classify_http_failure(status: StatusCode, body: &[u8]) -> AttemptFailure {
         // rejections and (slower, but still surfaced) malformed requests.
         return AttemptFailure::InvalidArgument(err);
     }
-    if status.is_server_error() {
+    // 408 and 5xx are transient (Troubleshooting docs: retry 429, 408, 5xx).
+    if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
         AttemptFailure::Transient(err)
     } else {
         AttemptFailure::Fatal(err)
@@ -1713,6 +1827,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             }],
             url_context: None,
+            google_search: None,
         };
         let text_content = |s: &str| Content {
             role: "user".to_string(),
@@ -1723,6 +1838,8 @@ mod tests {
         };
         // Built-in tool declared -> on.
         assert!(needs_tool_config(std::slice::from_ref(&url_tool), &[text_content("hi")]));
+        // google_search is a built-in server-side tool too -> on.
+        assert!(needs_tool_config(std::slice::from_ref(&Tool::google_search()), &[text_content("hi")]));
         // Only function declarations, plain history -> off.
         assert!(!needs_tool_config(std::slice::from_ref(&fn_tool), &[text_content("hi")]));
         // No tools at all, plain history -> off.
@@ -2085,6 +2202,113 @@ mod tests {
     }
 
     #[test]
+    fn classify_leaked_key_gets_actionable_reason() {
+        // Google's leaked-key block message must surface as "mint a NEW key",
+        // not a generic 403 dump (Troubleshooting docs).
+        let body = br#"{"error":{"code":403,"message":"Your API key was reported as leaked. Please use another API key.","status":"PERMISSION_DENIED"}}"#;
+        match classify_http_failure(StatusCode::FORBIDDEN, body) {
+            AttemptFailure::Dead(reason) => {
+                assert!(reason.contains("leaked"), "reason names the cause: {reason}");
+                assert!(reason.contains("NEW key"), "reason is actionable: {reason}");
+            }
+            other => panic!("leaked key must be Dead, got {other:?}"),
+        }
+        // An ordinary 403 keeps the raw-body reason.
+        match classify_http_failure(StatusCode::FORBIDDEN, b"forbidden") {
+            AttemptFailure::Dead(reason) => assert!(reason.contains("forbidden")),
+            other => panic!("plain 403 must be Dead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backoff_stays_within_jitter_bounds() {
+        for (retries, base_ms) in [(1, 1000u64), (2, 2000), (3, 4000), (4, 8000), (99, 8000)] {
+            for _ in 0..50 {
+                let d = backoff(retries).as_millis() as u64;
+                let spread = base_ms / 4;
+                assert!(
+                    (base_ms - spread..=base_ms + spread).contains(&d),
+                    "backoff({retries}) = {d}ms outside ±25% of {base_ms}ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_level_support_matrix() {
+        // Unrestricted models (Thinking docs): every level passes.
+        for level in ["minimal", "low", "medium", "high"] {
+            assert!(thinking_level_supported("gemini-3.6-flash", level));
+            assert!(thinking_level_supported("gemini-3.5-flash-lite", level));
+            assert!(thinking_level_supported("gemini-some-future-model", level), "unknown models are never blocked");
+        }
+        // gemini-3-pro-preview: low/high only.
+        assert!(thinking_level_supported("gemini-3-pro-preview", "low"));
+        assert!(thinking_level_supported("gemini-3-pro-preview", "high"));
+        assert!(!thinking_level_supported("gemini-3-pro-preview", "minimal"));
+        assert!(!thinking_level_supported("gemini-3-pro-preview", "medium"));
+        // gemini-3.1-pro-preview: no minimal.
+        assert!(!thinking_level_supported("gemini-3.1-pro-preview", "minimal"));
+        assert!(thinking_level_supported("gemini-3.1-pro-preview", "medium"));
+        // gemini-3.1-flash-lite-image: minimal/high only.
+        assert!(thinking_level_supported("gemini-3.1-flash-lite-image", "minimal"));
+        assert!(!thinking_level_supported("gemini-3.1-flash-lite-image", "low"));
+        // gemini-2.5 family: no minimal. "models/"-prefixed names work too.
+        assert!(!thinking_level_supported("models/gemini-2.5-flash", "minimal"));
+        assert!(thinking_level_supported("models/gemini-2.5-pro", "medium"));
+    }
+
+    #[test]
+    fn build_generation_config_drops_unsupported_level() {
+        let client = client_with_keys(1);
+        client.set_generation_model("gemini-3-pro-preview".to_string());
+        client.set_thinking_level(Some("minimal".to_string()));
+        // The unsupported level is dropped -> every knob unset -> config omitted.
+        assert!(client.build_generation_config(None, None, false, false).is_none());
+        // A supported level survives.
+        client.set_thinking_level(Some("high".to_string()));
+        let cfg = client
+            .build_generation_config(None, None, false, false)
+            .expect("supported level produces a config");
+        assert_eq!(
+            cfg.thinking_config.map(|t| t.thinking_level).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn parse_turn_collects_grounding_metadata() {
+        let raw = r#"{
+            "candidates": [{
+                "content": { "parts": [{"text": "Spain won."}], "role": "model" },
+                "groundingMetadata": {
+                    "webSearchQueries": ["euro 2024 winner", "who won euro 2024"],
+                    "searchEntryPoint": { "renderedContent": "<!-- widget -->" },
+                    "groundingChunks": [
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/1", "title": "aljazeera.com"}},
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/2", "title": "Aljazeera.com"}},
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/3", "title": "uefa.com"}},
+                        {"web": {"uri": "https://vertexaisearch.cloud.google.com/4"}},
+                        {"images": {"uri": "https://x"}}
+                    ]
+                }
+            }]
+        }"#;
+        let response: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let turn = parse_turn(response).unwrap_or_else(|_| panic!("turn parses"));
+        assert_eq!(turn.text.as_deref(), Some("Spain won."));
+        assert_eq!(
+            turn.grounded_queries,
+            vec!["euro 2024 winner".to_string(), "who won euro 2024".to_string()]
+        );
+        assert_eq!(
+            turn.grounded_sources,
+            vec!["aljazeera.com".to_string(), "uefa.com".to_string()],
+            "titles deduped case-insensitively; missing titles and non-web chunks skipped"
+        );
+    }
+
+    #[test]
     fn classify_maps_statuses() {
         assert!(matches!(
             classify_http_failure(StatusCode::TOO_MANY_REQUESTS, b"{}"),
@@ -2100,6 +2324,11 @@ mod tests {
         ));
         assert!(matches!(
             classify_http_failure(StatusCode::INTERNAL_SERVER_ERROR, b"boom"),
+            AttemptFailure::Transient(_)
+        ));
+        // 408 is transient per the Troubleshooting docs (retry 429, 408, 5xx).
+        assert!(matches!(
+            classify_http_failure(StatusCode::REQUEST_TIMEOUT, b"slow"),
             AttemptFailure::Transient(_)
         ));
         // Plain 400: cool the key and fail over (per-project rejection or
@@ -2138,6 +2367,7 @@ mod tests {
                     }),
                 }],
                 url_context: None,
+                google_search: None,
             },
         ];
         let mut contents = vec![crate::models::Content {
@@ -2207,5 +2437,44 @@ mod tests {
             });
         }
         panic!("loop never produced a final answer");
+    }
+
+    /// LIVE verification that the built-in google_search tool grounds an
+    /// answer in one turn AND that its queries/source titles are collected.
+    /// Run manually:
+    /// `GEMINI_API_KEY=... cargo test google_search_grounds_answer -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn google_search_grounds_answer() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let client = GeminiClient::new(key);
+        let lease = client.acquire_lease().expect("lease");
+        let tools = vec![crate::models::Tool::google_search()];
+        let contents = vec![crate::models::Content {
+            role: "user".to_string(),
+            parts: vec![crate::models::Part::Text {
+                text: "Who won the most recent UEFA European Championship? Answer in one sentence."
+                    .to_string(),
+                thought_signature: None,
+            }],
+        }];
+        let turn = client
+            .generate_turn_with(&lease, "You are a helpful assistant.", &contents, &tools)
+            .await
+            .expect("live generateContent with google_search");
+        println!(
+            "text={:?} queries={:?} sources={:?}",
+            turn.text, turn.grounded_queries, turn.grounded_sources
+        );
+        assert!(turn.function_calls.is_empty(), "built-in tool: no client-side calls");
+        assert!(turn.text.as_deref().unwrap_or("").len() > 10, "a real answer came back");
+        assert!(
+            !turn.grounded_queries.is_empty(),
+            "the model searched (queries are the billable unit)"
+        );
+        assert!(
+            !turn.grounded_sources.is_empty(),
+            "grounding chunk titles collected for the Sources footer"
+        );
     }
 }

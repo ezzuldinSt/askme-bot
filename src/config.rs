@@ -125,6 +125,10 @@ pub struct ConfigOverrides {
     /// Built-in Gemini URL context tool: the model auto-fetches http(s) URLs
     /// from the conversation instead of calling web_fetch for them.
     pub url_context_enabled: Option<bool>,
+    /// Built-in Google Search grounding tool (replaces the custom web_search
+    /// when on). Billed per executed search query past the free allowance —
+    /// default OFF.
+    pub search_grounding_enabled: Option<bool>,
     /// Max bytes web_fetch downloads per URL.
     pub web_fetch_max_bytes: Option<usize>,
     /// Per-request timeout for web_fetch, in seconds.
@@ -319,6 +323,11 @@ pub struct ToolsConfig {
     pub user_scan_posts_limit: u64,
     pub user_scan_fact_cap: usize,
     pub url_context_enabled: bool,
+    /// Built-in Google Search grounding: the model searches the web
+    /// server-side in the same turn. When on, the custom web_search tool is
+    /// not declared. Default false (bills per executed query past the free
+    /// allowance).
+    pub search_grounding_enabled: bool,
     /// Max key-failover attempts per reply flow (each arm re-runs the flow).
     pub max_flow_attempts: usize,
 }
@@ -416,6 +425,12 @@ impl RuntimeConfig {
                     std::env::var("URL_CONTEXT_ENABLED")
                         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
                         .unwrap_or(true)
+                }),
+                // Opt-in: OFF unless explicitly enabled (bills per query).
+                search_grounding_enabled: overrides.search_grounding_enabled.unwrap_or_else(|| {
+                    std::env::var("SEARCH_GROUNDING_ENABLED")
+                        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                        .unwrap_or(false)
                 }),
                 max_flow_attempts: overrides
                     .max_flow_attempts

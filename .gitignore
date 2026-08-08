@@ -7,6 +7,7 @@ output.log
 
 # Admin panel config (contains API keys + password hash)
 bot_config.json
+bot_config.json.bak
 
 # Support FAQ store (per-instance data written by the admin panel)
 support_faqs.json

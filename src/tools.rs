@@ -206,6 +206,10 @@ impl ToolContext {
         self.runtime.read().await.tools.url_context_enabled
     }
 
+    pub async fn search_grounding_enabled(&self) -> bool {
+        self.runtime.read().await.tools.search_grounding_enabled
+    }
+
     /// Execute one requested tool call and return the JSON result the model
     /// should see. Unknown tools and handler failures become `{"error": ...}`.
     ///
@@ -994,8 +998,11 @@ pub fn profile_scan_text(username: &str, contents: &[&str]) -> String {
 /// about WHEN to use each tool and what it returns. When `url_context_enabled`
 /// is set, the built-in URL context tool is added first: the model then
 /// auto-fetches any http(s) URL present in the conversation, with zero extra
-/// tool rounds.
-pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
+/// tool rounds. When `search_grounding_enabled` is set, the built-in Google
+/// Search tool is added too — and the custom `web_search` (Exa/DDG) is left
+/// out: grounding answers search-needing questions in one server-side turn,
+/// so the two-round custom path would only compete with it.
+pub fn tool_declarations(url_context_enabled: bool, search_grounding_enabled: bool) -> Vec<Tool> {
     let params = |properties: Value, required: &[&str]| {
         let mut p = json!({ "type": "object", "properties": properties });
         if !required.is_empty() {
@@ -1008,10 +1015,14 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
     if url_context_enabled {
         tools.push(Tool::url_context());
     }
+    if search_grounding_enabled {
+        tools.push(Tool::google_search());
+    }
 
-    tools.extend(vec![
-        Tool {
+    if !search_grounding_enabled {
+        tools.push(Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "web_search".to_string(),
                 description: format!(
@@ -1026,12 +1037,16 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
                     &["query"],
                 ),
             }],
-        },
+        });
+    }
+
+    tools.extend(vec![
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "web_fetch".to_string(),
-                description: "Fetch a webpage and return its readable text content. FALLBACK TOOL: URLs in the user's message are fetched automatically by the URL context tool — do NOT call web_fetch for those. Use web_fetch only (1) for a URL that came from web_search results or elsewhere in the conversation, or (2) when the automatic URL fetch failed. Only http/https URLs. Large pages are truncated.".to_string(),
+                description: "Fetch a webpage and return its readable text content. FALLBACK TOOL: URLs in the user's message are fetched automatically by the URL context tool — do NOT call web_fetch for those. Use web_fetch only (1) for a URL that came from search results or elsewhere in the conversation, or (2) when the automatic URL fetch failed. Only http/https URLs. Large pages are truncated.".to_string(),
                 parameters: params(
                     json!({ "url": { "type": "string", "description": "The http(s) URL to fetch" } }),
                     &["url"],
@@ -1040,6 +1055,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "search_users".to_string(),
                 description: "Search Things users by username, display name, or Arabic name (Arabic queries are automatically transliterated to Latin variants). Results are ranked: exact username match first, then exact display name, then prefix/substring matches. If several users match the requested name, the result note says so — list the candidate usernames and ask the asker which one, never guess silently. Use to resolve a username (with or without @) or a person's name into a user id and basic info.".to_string(),
@@ -1051,6 +1067,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_user_profile".to_string(),
                 description: "Fetch a user's full public profile by numeric id: bio, display name, username, join date, streak, verified/premium flags. Use after search_users to learn more about a user the asker mentioned. For the bot's SAVED long-term facts about someone, use get_user_facts instead.".to_string(),
@@ -1062,6 +1079,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_user_posts".to_string(),
                 description: "Fetch a user's most recent posts (newest first, up to 10) by numeric user id. Use to learn what a user talks about, their style or opinions. Only currently-visible posts are returned (Things posts expire after a few hours), so the list may be short or empty. Durable facts from these posts are saved to memory automatically.".to_string(),
@@ -1076,6 +1094,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_user_facts".to_string(),
                 description: "Return the bot's saved long-term facts about a user, by exact username (no @). Facts are learned from past conversations and profile scans (e.g. location, job, preferences). Use when asked 'what do you know about X?' or when a question references another user's personal details.".to_string(),
@@ -1087,6 +1106,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "search_user_facts".to_string(),
                 description: "Search the bot's saved long-term facts across ALL users by name or keyword. Use when the exact username is unknown or the asker gave a real name ('what do you know about Khaled?'). Returns facts tagged with the user they belong to.".to_string(),
@@ -1098,6 +1118,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_post".to_string(),
                 description: "Fetch a single post by its numeric id. Use when the user links or references a specific post and you need its exact content.".to_string(),
@@ -1109,6 +1130,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_thread".to_string(),
                 description: "Fetch the conversation thread above a post (its ancestors, oldest first). Use when the user references a post whose surrounding discussion matters for the answer.".to_string(),
@@ -1120,6 +1142,7 @@ pub fn tool_declarations(url_context_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             url_context: None,
+            google_search: None,
             function_declarations: vec![FunctionDeclaration {
                 name: "get_current_time".to_string(),
                 description: "Return the current UTC time. Use when the answer depends on the date or time.".to_string(),
@@ -1319,7 +1342,7 @@ mod tests {
 
     #[test]
     fn tool_declarations_have_expected_tools() {
-        let tools = tool_declarations(true);
+        let tools = tool_declarations(true, false);
         let names: Vec<&str> = tools
             .iter()
             .flat_map(|t| &t.function_declarations)
@@ -1349,16 +1372,46 @@ mod tests {
 
     #[test]
     fn url_context_tool_included_when_enabled() {
-        let on = serde_json::to_value(tool_declarations(true)).unwrap();
+        let on = serde_json::to_value(tool_declarations(true, false)).unwrap();
         assert!(on[0]["urlContext"].is_object(), "url_context tool first when enabled");
 
-        let off = serde_json::to_value(tool_declarations(false)).unwrap();
+        let off = serde_json::to_value(tool_declarations(false, false)).unwrap();
         let off_array = off.as_array().expect("serialized tools are an array");
         assert!(
             off_array
                 .iter()
                 .all(|t| t["urlContext"].is_null() && t["functionDeclarations"].is_array()),
             "no urlContext entry when disabled"
+        );
+    }
+
+    #[test]
+    fn search_grounding_replaces_custom_web_search() {
+        let on = serde_json::to_value(tool_declarations(true, true)).unwrap();
+        let on_array = on.as_array().expect("serialized tools are an array");
+        assert!(
+            on_array.iter().any(|t| t["googleSearch"].is_object()),
+            "google_search built-in tool present when grounding is enabled"
+        );
+        let declared: Vec<String> = on_array
+            .iter()
+            .flat_map(|t| t["functionDeclarations"].as_array().cloned().unwrap_or_default())
+            .filter_map(|f| f["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !declared.iter().any(|n| n == "web_search"),
+            "custom web_search is dropped when grounding is on: {declared:?}"
+        );
+        assert!(
+            declared.iter().any(|n| n == "web_fetch"),
+            "web_fetch stays — grounding doesn't read full pages"
+        );
+
+        let off = serde_json::to_value(tool_declarations(true, false)).unwrap();
+        let off_array = off.as_array().expect("serialized tools are an array");
+        assert!(
+            off_array.iter().all(|t| t["googleSearch"].is_null()),
+            "no googleSearch entry when grounding is disabled"
         );
     }
 

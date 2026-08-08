@@ -354,6 +354,11 @@ pub struct Tool {
     /// prompt. Serializes as `{"urlContext": {}}` when set.
     #[serde(rename = "urlContext", skip_serializing_if = "Option::is_none")]
     pub url_context: Option<serde_json::Value>,
+    /// The built-in Google Search grounding tool: the model searches the web
+    /// server-side and answers with grounding metadata (queries + source
+    /// chunks) in the same turn. Serializes as `{"googleSearch": {}}` when set.
+    #[serde(rename = "googleSearch", skip_serializing_if = "Option::is_none")]
+    pub google_search: Option<serde_json::Value>,
 }
 
 impl Tool {
@@ -361,6 +366,15 @@ impl Tool {
         Self {
             function_declarations: Vec::new(),
             url_context: Some(serde_json::json!({})),
+            google_search: None,
+        }
+    }
+
+    pub fn google_search() -> Self {
+        Self {
+            function_declarations: Vec::new(),
+            url_context: None,
+            google_search: Some(serde_json::json!({})),
         }
     }
 }
@@ -496,6 +510,36 @@ pub struct Candidate {
     /// Which URLs the URL context tool retrieved this turn, with per-URL status.
     #[serde(rename = "urlContextMetadata")]
     pub url_context_metadata: Option<UrlContextMetadata>,
+    /// Google Search grounding metadata (present when the built-in
+    /// google_search tool ran this turn).
+    #[serde(rename = "groundingMetadata")]
+    pub grounding_metadata: Option<GroundingMetadata>,
+}
+
+/// Google Search grounding metadata. Only the fields this bot reads are
+/// modeled: the executed queries (cost visibility — Gemini 3 bills per
+/// query) and the source chunks (their titles feed the Sources footer).
+/// `searchEntryPoint`/`groundingSupports` are deliberately not modeled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroundingMetadata {
+    #[serde(rename = "webSearchQueries")]
+    pub web_search_queries: Option<Vec<String>>,
+    #[serde(rename = "groundingChunks")]
+    pub grounding_chunks: Option<Vec<GroundingChunk>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroundingChunk {
+    pub web: Option<GroundingWeb>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroundingWeb {
+    /// A vertexaisearch.cloud.google.com REDIRECT URL, not the original
+    /// link — never posted; only `title` is presentable.
+    pub uri: Option<String>,
+    /// The source name (e.g. "aljazeera.com") shown in the Sources footer.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,6 +589,10 @@ pub struct UsageMetadata {
     pub totalTokenCount: Option<i32>,
     /// Billed thinking tokens (Thinking docs: output price = output + thoughts).
     pub thoughtsTokenCount: Option<i32>,
+    /// Prompt tokens served from an implicit context-cache hit (caching is on
+    /// by default for Gemini 2.5+; zero means no hit — e.g. below the
+    /// per-model minimum prefix size).
+    pub cachedContentTokenCount: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
