@@ -150,6 +150,10 @@ pub struct ConfigOverrides {
     pub gemini_api_keys: Vec<String>,
     /// Chat model for replies (hot-applied, no restart needed).
     pub generation_model: Option<String>,
+    /// Saturation fallback for the chat model: one whole-flow arm runs on it
+    /// when the primary exhausts its transient retries (503 storms). None or
+    /// empty = disabled. Hot-applied, no restart needed.
+    pub fallback_generation_model: Option<String>,
     /// Cheaper model for fact extraction/FAQ jobs; None = use generation_model.
     pub extraction_model: Option<String>,
     /// Gemini 3.x thinking level: "minimal"|"low"|"medium"|"high", or None for
@@ -175,6 +179,20 @@ pub fn resolve_generation_model(overrides: &ConfigOverrides) -> String {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var("GENERATION_MODEL").ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_GENERATION_MODEL.to_string())
+}
+
+/// override > env `FALLBACK_GENERATION_MODEL` > None (disabled). A value
+/// equal to the primary model is treated as disabled at use time.
+pub fn resolve_fallback_generation_model(overrides: &ConfigOverrides) -> Option<String> {
+    overrides
+        .fallback_generation_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("FALLBACK_GENERATION_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
 }
 
 /// override > env `THINKING_LEVEL` > None (model default). Invalid values are
@@ -558,6 +576,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_generation_model(&blank), DEFAULT_GENERATION_MODEL);
+    }
+
+    #[test]
+    fn fallback_model_resolver() {
+        let empty = ConfigOverrides::default();
+        assert_eq!(resolve_fallback_generation_model(&empty), None, "unset = disabled");
+        let with = ConfigOverrides {
+            fallback_generation_model: Some("gemini-3.6-flash".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_fallback_generation_model(&with).as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        let blank = ConfigOverrides {
+            fallback_generation_model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_fallback_generation_model(&blank), None, "blank = disabled");
     }
 
     #[test]

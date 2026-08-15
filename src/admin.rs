@@ -432,6 +432,12 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
     let o = &cfg.overrides;
     let resolved = RuntimeConfig::resolve(o);
     let m = &resolved.memory;
+    let fallback_generation_model = st
+        .app
+        .read()
+        .await
+        .gemini
+        .fallback_generation_model();
     Ok(Json(json!({
         "hot": {
             "user_facts_limit": m.user_facts_limit,
@@ -443,6 +449,8 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "extraction_min_chars": m.extraction_min_chars,
             "context_depth_limit": resolved.context_depth_limit,
             "generation_model": config::resolve_generation_model(o),
+            // Raw override ("" when unset) + the live client value for display.
+            "fallback_generation_model": fallback_generation_model,
             // Raw override ("" when unset) for the form + the effective value
             // for display: unset means "same as the chat model".
             "extraction_model": o.extraction_model.clone().unwrap_or_default(),
@@ -477,6 +485,7 @@ async fn get_config(_: Auth, State(st): State<AdminState>) -> ApiResult<Json<Val
             "context_depth_limit": o.context_depth_limit.is_some(),
             "gemini_api_keys": !o.gemini_api_keys.is_empty(),
             "generation_model": o.generation_model.is_some(),
+            "fallback_generation_model": o.fallback_generation_model.is_some(),
             "extraction_model": o.extraction_model.is_some(),
             "thinking_level": o.thinking_level.is_some(),
             "qdrant_url": o.qdrant_url.is_some(),
@@ -525,6 +534,9 @@ struct ConfigUpdate {
     /// (the wholesale replace) is non-empty — replace wins.
     gemini_api_keys_add: Option<Vec<String>>,
     generation_model: Option<String>,
+    /// Saturation fallback for the chat model: empty = disabled, value =
+    /// set. Hot-applied, no restart.
+    fallback_generation_model: Option<String>,
     /// Extraction model: empty = "same as chat model" (clears the override).
     extraction_model: Option<String>,
     /// "default" or one of THINKING_LEVELS (empty/None = leave unchanged).
@@ -742,6 +754,20 @@ async fn put_config(
         o.generation_model = Some(m.clone());
     }
 
+    // Fallback model: empty string = disabled (clears the override); a
+    // value sets it. Same shape as the extraction-model handling.
+    let new_fallback_generation_model = match req.fallback_generation_model {
+        Some(m) => {
+            let m = m.trim().to_string();
+            if m.chars().any(char::is_whitespace) {
+                return err(StatusCode::BAD_REQUEST, "fallback model must not contain whitespace");
+            }
+            o.fallback_generation_model = (!m.is_empty()).then_some(m.clone());
+            Some(o.fallback_generation_model.clone())
+        }
+        None => None,
+    };
+
     // Extraction model: empty string = "same as chat model" (clears the
     // override); a value sets it. Hot-applied, no restart.
     let new_extraction_model = match req.extraction_model {
@@ -843,6 +869,9 @@ async fn put_config(
     }
     if let Some(m) = new_generation_model {
         gemini.set_generation_model(m);
+    }
+    if let Some(m) = new_fallback_generation_model {
+        gemini.set_fallback_generation_model(m);
     }
     if let Some(m) = new_extraction_model {
         gemini.set_extraction_model(m);

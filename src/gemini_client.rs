@@ -18,7 +18,18 @@ const POLL_INTERVAL_MS: u64 = 5_000;
 const MAX_POLL_ATTEMPTS: u32 = 24;
 const EMBED_CACHE_MAX: usize = 2000;
 const HTTP_TIMEOUT_SECS: u64 = 120;
-const GENERATE_MAX_ATTEMPTS: u32 = 3;
+/// In-flow transient retries (5xx/transport). Five attempts with the backoff
+/// curve below tolerate ~75s of a Google-side overload spike before the
+/// caller parks the model and fails over.
+const GENERATE_MAX_ATTEMPTS: u32 = 5;
+/// After a model's transient retries exhaust (503 "high demand" storms), it
+/// is parked for this long: flows skip parked models with ZERO API calls so
+/// the poll loop's uncounted retry can wait the spike out cheaply.
+const MODEL_OVERLOAD_PARK_SECS: u64 = 60;
+/// Backoff curve per transient retry (1-based). ~1.5s/4s/10s/20s/40s ≈ 75s
+/// total, then the model parks. Longer than the 10s the old 1/2/4 curve
+/// allowed — observed 503 spikes last minutes, not seconds.
+const BACKOFF_STEPS_MS: [u64; 5] = [1500, 4000, 10000, 20000, 40000];
 /// Default cooldown for a 429 with no parseable RetryInfo.
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
 /// Cooldown for a 400 INVALID_ARGUMENT: long enough to mostly skip sticky
@@ -103,6 +114,12 @@ pub enum GeminiError {
 #[derive(Debug, thiserror::Error)]
 #[error("transient Gemini errors exhausted all retries: {0}")]
 pub struct TransientExhausted(anyhow::Error);
+
+impl TransientExhausted {
+    pub fn new(err: anyhow::Error) -> Self {
+        Self(err)
+    }
+}
 
 /// True if the error (or anything in its chain) is a `TransientExhausted`.
 pub fn is_transient_exhausted(err: &anyhow::Error) -> bool {
@@ -312,6 +329,10 @@ pub struct GeminiClient {
     pool: Arc<Mutex<KeyPool>>,
     /// Chat model used for replies; hot-swappable (shared across clones).
     generation_model: Arc<std::sync::RwLock<String>>,
+    /// Saturation fallback for the chat model (e.g. 3.6-flash while the
+    /// primary is 3.7-flash): used for one whole-flow arm when the primary
+    /// exhausts its transient retries. None = no fallback. Hot-swappable.
+    fallback_generation_model: Arc<std::sync::RwLock<Option<String>>>,
     /// Model for extraction/FAQ/rewrite jobs; None = use generation_model.
     /// Hot-swappable (shared across clones).
     extraction_model: Arc<std::sync::RwLock<Option<String>>>,
@@ -328,6 +349,10 @@ pub struct GeminiClient {
     embedding_dimensions: u32,
     embedding_batch_size: usize,
     embed_cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
+    /// Models parked after their transient retries exhausted (Google-side
+    /// overload): model name -> resume-at instant. Flows skip parked models
+    /// entirely, spending zero API calls while the spike lasts.
+    parked_models: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 fn mask_key(key: &str) -> String {
@@ -338,6 +363,8 @@ fn mask_key(key: &str) -> String {
 /// Construction knobs for the Gemini client (keeps the constructor tidy).
 pub struct GeminiOptions {
     pub generation_model: String,
+    /// Saturation fallback for the chat model; None = disabled.
+    pub fallback_generation_model: Option<String>,
     pub extraction_model: Option<String>,
     pub thinking_level: Option<String>,
     pub extraction_thinking_level: Option<String>,
@@ -354,6 +381,7 @@ impl GeminiClient {
             vec![api_key],
             GeminiOptions {
                 generation_model: crate::config::DEFAULT_GENERATION_MODEL.to_string(),
+                fallback_generation_model: None,
                 extraction_model: None,
                 thinking_level: None,
                 extraction_thinking_level: None,
@@ -367,6 +395,7 @@ impl GeminiClient {
     pub fn with_keys(api_keys: Vec<String>, options: GeminiOptions) -> Self {
         let GeminiOptions {
             generation_model,
+            fallback_generation_model,
             extraction_model,
             thinking_level,
             extraction_thinking_level,
@@ -396,6 +425,7 @@ impl GeminiClient {
                 cursor: 0,
             })),
             generation_model: Arc::new(std::sync::RwLock::new(generation_model)),
+            fallback_generation_model: Arc::new(std::sync::RwLock::new(fallback_generation_model)),
             extraction_model: Arc::new(std::sync::RwLock::new(extraction_model)),
             thinking_level: Arc::new(std::sync::RwLock::new(thinking_level)),
             extraction_thinking_level: Arc::new(std::sync::RwLock::new(extraction_thinking_level)),
@@ -404,6 +434,7 @@ impl GeminiClient {
             embedding_dimensions,
             embedding_batch_size,
             embed_cache: Arc::new(Mutex::new(HashMap::new())),
+            parked_models: Arc::new(Mutex::new(HashMap::new())),
         };
         client.warn_on_unsupported_thinking_level();
         client
@@ -423,6 +454,47 @@ impl GeminiClient {
     /// The currently active chat model.
     pub fn generation_model(&self) -> String {
         self.generation_model.read().unwrap().clone()
+    }
+
+    /// Hot-swap the saturation fallback model (None = disabled; propagates to
+    /// every clone). Setting it to the primary model disables the fallback.
+    pub fn set_fallback_generation_model(&self, model: Option<String>) {
+        let model = model.filter(|m| !m.trim().is_empty());
+        let mut current = self.fallback_generation_model.write().unwrap();
+        if *current != model {
+            info!(
+                "Fallback generation model changed: {:?} -> {:?}",
+                *current, model
+            );
+            *current = model;
+        }
+    }
+
+    /// The configured saturation fallback for the chat model, if any.
+    pub fn fallback_generation_model(&self) -> Option<String> {
+        self.fallback_generation_model.read().unwrap().clone()
+    }
+
+    /// Park a model after its transient retries exhausted — almost always a
+    /// Google-side overload spike (503 "high demand"). Parked models are
+    /// skipped by flows for `MODEL_OVERLOAD_PARK_SECS` with zero API calls.
+    pub fn park_model(&self, model: &str) {
+        let until = Instant::now() + Duration::from_secs(MODEL_OVERLOAD_PARK_SECS);
+        self.parked_models
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), until);
+        warn!(
+            "Model {model} parked for {MODEL_OVERLOAD_PARK_SECS}s \
+             (transient retries exhausted — likely Google-side overload)"
+        );
+    }
+
+    /// True while the model is parked. Lazily drops expired entries.
+    pub fn model_parked(&self, model: &str) -> bool {
+        let mut parked = self.parked_models.lock().unwrap();
+        parked.retain(|_, until| *until > Instant::now());
+        parked.contains_key(model)
     }
 
     /// Hot-swap the extraction model (None = fall back to the chat model).
@@ -500,14 +572,17 @@ impl GeminiClient {
     /// Assemble the generationConfig for one request family. `extraction`
     /// selects the extraction thinking level (classification-grade) instead
     /// of the chat level; `media` gates the global mediaResolution (only
-    /// requests that can carry media parts get it). Returns None when every
-    /// knob is unset so the field is omitted entirely.
+    /// requests that can carry media parts get it). `model` is the model the
+    /// request will actually run on (may be the fallback arm) — the thinking
+    /// level is validated against IT. Returns None when every knob is unset
+    /// so the field is omitted entirely.
     fn build_generation_config(
         &self,
         response_mime_type: Option<String>,
         response_schema: Option<serde_json::Value>,
         extraction: bool,
         media: bool,
+        model: &str,
     ) -> Option<GenerationConfig> {
         let thinking_level = if extraction {
             self.extraction_thinking_level.read().unwrap().clone()
@@ -518,13 +593,8 @@ impl GeminiClient {
         // per-model matrix): sending it would 400 every request. None = the
         // model default, which is always safe. The setters warn once per
         // change, so this filter stays silent.
-        let model = if extraction {
-            self.extraction_model()
-        } else {
-            self.generation_model()
-        };
         let thinking_level =
-            thinking_level.filter(|level| thinking_level_supported(&model, level));
+            thinking_level.filter(|level| thinking_level_supported(model, level));
         let media_resolution = media.then(|| self.media_resolution.clone()).flatten();
         if response_mime_type.is_none()
             && response_schema.is_none()
@@ -931,46 +1001,123 @@ impl GeminiClient {
 
     // ── GenerateContent ──
 
+    /// A model to fail an extraction job over to when `exhausted` burned its
+    /// transient retries: the configured generation fallback if usable, else
+    /// the chat model if usable. None = nothing else to try.
+    fn extraction_failover_model(&self, exhausted: &str) -> Option<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(fb) = self.fallback_generation_model() {
+            candidates.push(fb);
+        }
+        candidates.push(self.generation_model());
+        candidates
+            .into_iter()
+            .find(|c| c != exhausted && !self.model_parked(c))
+    }
+
+    /// The extraction model to use for a job: itself unless it is parked —
+    /// then a usable failover model (generation fallback / chat model) so
+    /// background memory keeps working through a saturation storm.
+    fn unparked_extraction_model(&self) -> String {
+        let model = self.extraction_model();
+        if !self.model_parked(&model) {
+            return model;
+        }
+        match self.extraction_failover_model(&model) {
+            Some(c) => {
+                warn!("{model} is parked; routing this extraction job to {c}");
+                c
+            }
+            None => model, // nothing better: the rotation's retries will try it
+        }
+    }
+
     /// Generate a response constrained to a JSON Schema (`responseMimeType`
     /// = application/json + `responseSchema` — Structured Outputs docs).
-    /// Stateless call: rotates per request.
+    /// Stateless call: rotates per request. If the extraction model exhausts
+    /// (overload spike), one retry runs on a failover model.
     pub async fn generate_json(
         &self,
         system_prompt: &str,
         user_text: &str,
         schema: serde_json::Value,
     ) -> Result<String> {
-        let model = self.extraction_model();
-        self.send_with_rotation(|key: String| {
-            let model = model.clone();
-            let schema = schema.clone();
-            async move {
-                self.try_generate(&key, &model, system_prompt, user_text, &[], Some(schema))
-                    .await
+        let model = self.unparked_extraction_model();
+        let result = self
+            .send_with_rotation(|key: String| {
+                let model = model.clone();
+                let schema = schema.clone();
+                async move {
+                    self.try_generate(&key, &model, system_prompt, user_text, &[], Some(schema))
+                        .await
+                }
+            })
+            .await;
+        match &result {
+            Err(e) if is_transient_exhausted(e) => {
+                self.park_model(&model);
+                if let Some(fb) = self.extraction_failover_model(&model) {
+                    warn!("generate_json: {model} exhausted; retrying once on {fb}");
+                    return self
+                        .send_with_rotation(|key: String| {
+                            let fb = fb.clone();
+                            let schema = schema.clone();
+                            async move {
+                                self.try_generate(&key, &fb, system_prompt, user_text, &[], Some(schema))
+                                    .await
+                            }
+                        })
+                        .await;
+                }
             }
-        })
-        .await
+            _ => {}
+        }
+        result
     }
 
     /// One plain-text rewrite pass (scaffold-leak cleanup), routed to the
     /// extraction model — a mechanical job that should not burn reply quota.
+    /// Falls back to a failover model when the extraction model is exhausted.
     pub async fn rewrite_text(&self, system_prompt: &str, user_text: &str) -> Result<String> {
-        let model = self.extraction_model();
-        self.send_with_rotation(|key: String| {
-            let model = model.clone();
-            async move { self.try_generate(&key, &model, system_prompt, user_text, &[], None).await }
-        })
-        .await
+        let model = self.unparked_extraction_model();
+        let result = self
+            .send_with_rotation(|key: String| {
+                let model = model.clone();
+                async move { self.try_generate(&key, &model, system_prompt, user_text, &[], None).await }
+            })
+            .await;
+        match &result {
+            Err(e) if is_transient_exhausted(e) => {
+                self.park_model(&model);
+                if let Some(fb) = self.extraction_failover_model(&model) {
+                    warn!("rewrite_text: {model} exhausted; retrying once on {fb}");
+                    return self
+                        .send_with_rotation(|key: String| {
+                            let fb = fb.clone();
+                            async move {
+                                self.try_generate(&key, &fb, system_prompt, user_text, &[], None).await
+                            }
+                        })
+                        .await;
+                }
+            }
+            _ => {}
+        }
+        result
     }
 
-    /// One tool-calling round on the lease's key: sends the contents history
-    /// plus tool declarations and returns the model's turn (text or calls).
-    /// 429/401/403 mark the key and return `GeminiError::RateLimited`; transient
-    /// errors get the same bounded same-key backoff as the text path. The tool
-    /// loop (in the caller) holds the lease across rounds.
+    /// One tool-calling round on the lease's key against an explicit model:
+    /// sends the contents history plus tool declarations and returns the
+    /// model's turn (text or calls). 429/401/403 mark the key and return
+    /// `GeminiError::RateLimited` (fail over to the next KEY); transient
+    /// errors get a bounded same-key backoff and, on exhaustion, park the
+    /// MODEL and return `TransientExhausted` (fail over to the next MODEL —
+    /// the caller detects it with `is_transient_exhausted`). The tool loop
+    /// (in the caller) holds the lease across rounds.
     pub async fn generate_turn_with(
         &self,
         lease: &KeyLease,
+        model: &str,
         system_prompt: &str,
         contents: &[Content],
         tools: &[Tool],
@@ -979,7 +1126,7 @@ impl GeminiClient {
         let mut max_tokens_retries = 0u32;
         loop {
             match self
-                .try_generate_turn(&lease.key, system_prompt, contents, tools)
+                .try_generate_turn(&lease.key, model, system_prompt, contents, tools)
                 .await
             {
                 Ok(turn) => {
@@ -1013,7 +1160,11 @@ impl GeminiClient {
                 Err(AttemptFailure::Transient(e)) => {
                     transient_retries += 1;
                     if transient_retries >= GENERATE_MAX_ATTEMPTS {
-                        return Err(GeminiError::Failed(e));
+                        // Model-level exhaustion (5xx storm), not a key
+                        // problem: park the model and mark the error so the
+                        // reply flow can switch models instead of keys.
+                        self.park_model(model);
+                        return Err(GeminiError::Failed(TransientExhausted(e).into()));
                     }
                     warn!("generateContent (tools) transient error (retry {transient_retries}): {e}");
                     sleep(backoff(transient_retries)).await;
@@ -1069,6 +1220,7 @@ impl GeminiClient {
                 json_schema,
                 true,
                 false,
+                model,
             ),
         };
 
@@ -1180,12 +1332,14 @@ impl GeminiClient {
         Ok(response)
     }
 
-    /// One tool-calling generateContent attempt: sends the full contents
-    /// history plus the tool declarations, and returns whatever the model
-    /// produced — a final text answer, or one-or-more function calls.
+    /// One tool-calling generateContent attempt against an explicit model:
+    /// sends the full contents history plus the tool declarations, and
+    /// returns whatever the model produced — a final text answer, or
+    /// one-or-more function calls.
     async fn try_generate_turn(
         &self,
         key: &str,
+        model: &str,
         system_prompt: &str,
         contents: &[Content],
         tools: &[Tool],
@@ -1208,12 +1362,10 @@ impl GeminiClient {
             tool_config: needs_tool_config(tools, contents).then_some(ToolConfig {
                 include_server_side_tool_invocations: true,
             }),
-            generation_config: self.build_generation_config(None, None, false, true),
+            generation_config: self.build_generation_config(None, None, false, true, model),
         };
 
-        let response = self
-            .send_generate(key, &self.generation_model(), request)
-            .await?;
+        let response = self.send_generate(key, model, request).await?;
         parse_turn(response)
     }
 
@@ -1351,11 +1503,12 @@ fn needs_tool_config(tools: &[Tool], contents: &[Content]) -> bool {
         })
 }
 
-/// Exponential backoff (1s/2s/4s/8s cap) with ±25% jitter — the
-/// Troubleshooting docs recommend jitter so concurrent workers/keys don't
-/// retry in lockstep. The jitter seed comes from a UUID: no RNG dependency.
+/// Exponential backoff over `BACKOFF_STEPS_MS` (clamped to the last step)
+/// with ±25% jitter — the Troubleshooting docs recommend jitter so
+/// concurrent workers/keys don't retry in lockstep. The jitter seed comes
+/// from a UUID: no RNG dependency.
 fn backoff(transient_retries: u32) -> Duration {
-    let base_ms = 1000 * (1u64 << transient_retries.saturating_sub(1).min(3));
+    let base_ms = BACKOFF_STEPS_MS[(transient_retries as usize).saturating_sub(1).min(BACKOFF_STEPS_MS.len() - 1)];
     let spread = base_ms / 4;
     let seed = u64::from(uuid::Uuid::new_v4().as_bytes()[0]); // 0..=255
     Duration::from_millis(base_ms - spread + (seed * spread * 2 / 255))
@@ -1947,6 +2100,7 @@ mod tests {
             (0..n).map(|i| format!("key-{i:04}")).collect(),
             GeminiOptions {
                 generation_model: crate::config::DEFAULT_GENERATION_MODEL.to_string(),
+                fallback_generation_model: None,
                 extraction_model: None,
                 thinking_level: None,
                 extraction_thinking_level: None,
@@ -2179,9 +2333,10 @@ mod tests {
         let client = client_with_keys(1);
         client.set_thinking_level(Some("high".to_string()));
         client.set_extraction_thinking_level(Some("minimal".to_string()));
+        let model = crate::config::DEFAULT_GENERATION_MODEL;
         // Chat path: chat level + media resolution gate.
         let chat = client
-            .build_generation_config(None, None, false, true)
+            .build_generation_config(None, None, false, true, model)
             .expect("chat config present");
         assert_eq!(
             chat.thinking_config.map(|t| t.thinking_level).as_deref(),
@@ -2189,7 +2344,7 @@ mod tests {
         );
         // Extraction path: the cheaper extraction level, no media resolution.
         let extract = client
-            .build_generation_config(Some("application/json".to_string()), None, true, false)
+            .build_generation_config(Some("application/json".to_string()), None, true, false, model)
             .expect("extraction config present");
         assert_eq!(
             extract.thinking_config.map(|t| t.thinking_level).as_deref(),
@@ -2198,7 +2353,7 @@ mod tests {
         assert_eq!(extract.response_mime_type.as_deref(), Some("application/json"));
         // Everything unset -> the whole field is omitted.
         let bare = client_with_keys(1);
-        assert!(bare.build_generation_config(None, None, false, false).is_none());
+        assert!(bare.build_generation_config(None, None, false, false, model).is_none());
     }
 
     #[test]
@@ -2222,7 +2377,17 @@ mod tests {
 
     #[test]
     fn backoff_stays_within_jitter_bounds() {
-        for (retries, base_ms) in [(1, 1000u64), (2, 2000), (3, 4000), (4, 8000), (99, 8000)] {
+        // New curve: ~1.5s/4s/10s/20s/40s (clamped at the last step) —
+        // ~75s total tolerance for 5xx overload spikes.
+        let steps: [(u32, u64); 6] = [
+            (1, 1500),
+            (2, 4000),
+            (3, 10000),
+            (4, 20000),
+            (5, 40000),
+            (99, 40000),
+        ];
+        for (retries, base_ms) in steps {
             for _ in 0..50 {
                 let d = backoff(retries).as_millis() as u64;
                 let spread = base_ms / 4;
@@ -2232,6 +2397,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn model_park_blocks_then_expires() {
+        let client = client_with_keys(1);
+        assert!(!client.model_parked("gemini-3.7-flash"));
+        client.park_model("gemini-3.7-flash");
+        assert!(client.model_parked("gemini-3.7-flash"));
+        assert!(!client.model_parked("gemini-3.6-flash"), "other models unaffected");
+        // Expired entries are dropped lazily (simulated by backdating).
+        {
+            let mut parked = client.parked_models.lock().unwrap();
+            if let Some(until) = parked.get_mut("gemini-3.7-flash") {
+                *until = std::time::Instant::now();
+            }
+        }
+        assert!(!client.model_parked("gemini-3.7-flash"), "park expired");
+    }
+
+    #[test]
+    fn fallback_model_hot_swap_propagates_to_clones() {
+        let client = client_with_keys(1);
+        let clone = client.clone();
+        assert_eq!(clone.fallback_generation_model(), None);
+        client.set_fallback_generation_model(Some("gemini-3.6-flash".to_string()));
+        assert_eq!(
+            clone.fallback_generation_model().as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        // Blank input clears it (the panel sends "" for "disabled").
+        client.set_fallback_generation_model(Some("   ".to_string()));
+        assert_eq!(clone.fallback_generation_model(), None);
+        // Same model as the primary is allowed to be stored; the flow skips
+        // it as a duplicate arm at use time.
+        client.set_fallback_generation_model(Some(clone.generation_model()));
+        assert_eq!(clone.fallback_generation_model(), Some(clone.generation_model()));
+    }
+
+    #[test]
+    fn extraction_failover_model_skips_parked_and_duplicates() {
+        let client = client_with_keys(1);
+        client.set_generation_model("gemini-3.7-flash".to_string());
+        client.set_fallback_generation_model(Some("gemini-3.6-flash".to_string()));
+        // Nothing parked: the configured fallback is the first candidate.
+        assert_eq!(
+            client.extraction_failover_model("gemini-3.7-flash").as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        // The exhausted model is never offered back: falls through to chat.
+        assert_eq!(
+            client.extraction_failover_model("gemini-3.6-flash").as_deref(),
+            Some("gemini-3.7-flash")
+        );
+        // Parked candidates are skipped; nothing usable -> None.
+        client.park_model("gemini-3.6-flash");
+        client.park_model("gemini-3.7-flash");
+        assert_eq!(client.extraction_failover_model("anything"), None);
+        // No fallback configured: the chat model is the only candidate.
+        let bare = client_with_keys(1);
+        assert_eq!(
+            bare.extraction_failover_model("other").as_deref(),
+            Some(bare.generation_model().as_str())
+        );
     }
 
     #[test]
@@ -2263,13 +2491,25 @@ mod tests {
         let client = client_with_keys(1);
         client.set_generation_model("gemini-3-pro-preview".to_string());
         client.set_thinking_level(Some("minimal".to_string()));
-        // The unsupported level is dropped -> every knob unset -> config omitted.
-        assert!(client.build_generation_config(None, None, false, false).is_none());
+        // The unsupported level is dropped (validated against the REQUEST'S
+        // model, not the configured one) -> every knob unset -> omitted.
+        assert!(client
+            .build_generation_config(None, None, false, false, "gemini-3-pro-preview")
+            .is_none());
         // A supported level survives.
         client.set_thinking_level(Some("high".to_string()));
         let cfg = client
-            .build_generation_config(None, None, false, false)
+            .build_generation_config(None, None, false, false, "gemini-3-pro-preview")
             .expect("supported level produces a config");
+        assert_eq!(
+            cfg.thinking_config.map(|t| t.thinking_level).as_deref(),
+            Some("high")
+        );
+        // The SAME level on the fallback arm's model (accepts all levels)
+        // survives too — the guard follows the request, not the config.
+        let cfg = client
+            .build_generation_config(None, None, false, false, "gemini-3.6-flash")
+            .expect("fallback-arm config produced");
         assert_eq!(
             cfg.thinking_config.map(|t| t.thinking_level).as_deref(),
             Some("high")
@@ -2382,7 +2622,7 @@ mod tests {
         let mut sources: Vec<String> = Vec::new();
         for _round in 0..3 {
             let turn = client
-                .generate_turn_with(&lease, "You are a helpful assistant.", &contents, &tools)
+                .generate_turn_with(&lease, &client.generation_model(), "You are a helpful assistant.", &contents, &tools)
                 .await
                 .expect("live generateContent with url_context + functions");
             println!(
@@ -2459,7 +2699,7 @@ mod tests {
             }],
         }];
         let turn = client
-            .generate_turn_with(&lease, "You are a helpful assistant.", &contents, &tools)
+            .generate_turn_with(&lease, &client.generation_model(), "You are a helpful assistant.", &contents, &tools)
             .await
             .expect("live generateContent with google_search");
         println!(

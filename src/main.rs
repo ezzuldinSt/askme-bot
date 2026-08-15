@@ -30,7 +30,7 @@ use crate::gemini_client::{
     is_transient_exhausted, GeminiClient, GeminiError, GenerateTurn, KeyLease,
 };
 use crate::models::{
-    Content, FileData, FunctionResponseData, Notification, Part, Post,
+    Content, FileData, FunctionResponseData, Notification, Part, Post, Tool,
 };
 use crate::qdrant_client::{MemoryWrite, QdrantClient};
 use crate::qdrant_models::{
@@ -170,10 +170,11 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let (generation_model, extraction_model, thinking_level, extraction_thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
+    let (generation_model, fallback_generation_model, extraction_model, thinking_level, extraction_thinking_level, embedding_model, embedding_dimensions, qdrant_url) = {
         let cfg = bot_config.read().await;
         (
             config::resolve_generation_model(&cfg.overrides),
+            config::resolve_fallback_generation_model(&cfg.overrides),
             config::resolve_extraction_model(&cfg.overrides),
             config::resolve_thinking_level(&cfg.overrides),
             config::resolve_extraction_thinking_level(&cfg.overrides),
@@ -186,6 +187,7 @@ async fn main() -> Result<()> {
         gemini_api_keys,
         crate::gemini_client::GeminiOptions {
             generation_model,
+            fallback_generation_model,
             extraction_model,
             thinking_level,
             extraction_thinking_level,
@@ -1413,9 +1415,9 @@ async fn process_notification(
         }
         Err(e) => {
             error!("Gemini generation failed for notification {notification_id}: {e}");
-            if e.chain()
-                .any(|cause| cause.downcast_ref::<AllKeysRateLimited>().is_some())
-            {
+            if is_capacity_pause(&e) {
+                // Quota cooldown or model-overload exhaustion: retried on the
+                // next poll uncounted — never poison-marked.
                 return ProcessOutcome::RateLimited;
             }
             return ProcessOutcome::Failed;
@@ -2780,6 +2782,16 @@ enum ToolsFlowError {
 #[error("all Gemini API keys are currently rate-limited")]
 struct AllKeysRateLimited;
 
+/// Capacity-pause marker: the poll loop retries the notification WITHOUT
+/// counting it toward the poison-mark budget. True for "all keys cooling"
+/// AND for transient (5xx/transport) exhaustion — a Google-side overload
+/// storm must never permanently drop a user's reply.
+fn is_capacity_pause(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.downcast_ref::<AllKeysRateLimited>().is_some())
+        || is_transient_exhausted(err)
+}
+
 /// Run one reply generation flow with rate-limit failover across the key pool.
 ///
 /// The flow uses a sticky key lease: media uploads and the generation that
@@ -2795,6 +2807,14 @@ struct AllKeysRateLimited;
 ///
 /// Returns the final text plus the URLs the model grounded the answer on
 /// (url_context retrievals), used for the Sources footer.
+///
+/// Flow arms are (model × key-lease): the primary model gets up to
+/// `max_flows` key arms (429/401/403 rotate the key); when the PRIMARY
+/// exhausts its in-flow transient retries (5xx overload storm — surfaced as
+/// `TransientExhausted` and parked), one more set of arms runs on the
+/// configured FALLBACK model. A real (non-transient) failure aborts the
+/// whole flow; when every usable model is parked/exhausted the error bubbles
+/// up as a capacity pause the poll loop retries uncounted.
 async fn generate_with_tools_failover(
     gemini: &GeminiClient,
     system_prompt: &str,
@@ -2802,117 +2822,148 @@ async fn generate_with_tools_failover(
     media_files: &[DownloadedMedia],
     tool_ctx: &ToolContext,
 ) -> Result<(String, ReplySources)> {
-    // Key-failover arms: each re-runs the whole flow (rounds + uploads), so
-    // an uncapped pool (16 keys) could multiply one reply's cost by 16 in a
-    // 429 storm. A small cap degrades to "retry next poll" instead.
+    // Key-failover arms PER MODEL: each re-runs the whole flow (rounds +
+    // uploads), so an uncapped pool (16 keys) could multiply one reply's
+    // cost by 16 in a 429 storm. A small cap degrades to "retry next poll"
+    // instead.
     let max_flows = flow_attempt_cap(
         gemini.pool_size(),
         tool_ctx.runtime.read().await.tools.max_flow_attempts,
     );
     let mut last_err: Option<anyhow::Error> = None;
     // Profile-scan extraction jobs already flushed at the end of a flow arm,
-    // deduped by username across key-failover retries of the same reply.
+    // deduped by username across key/model-failover retries of the same reply.
     let mut flushed: HashSet<String> = HashSet::new();
 
-    for _ in 0..max_flows {
-        let lease = match gemini.acquire_lease() {
-            Some(l) => l,
-            None => {
-                // Every key is cooling down: wait for the earliest one to thaw.
-                gemini.wait_for_cooldown().await;
-                continue;
-            }
-        };
-
-        let mut file_uris: Vec<(String, String)> = Vec::new();
-        let mut rate_limited = false;
-        for file in media_files {
-            tool_ctx.meter.upload();
-            match gemini
-                .upload_file_with(&lease, &file.data, &file.mime, &file.display_name)
-                .await
-            {
-                Ok(uri) => {
-                    info!("Media uploaded to Gemini: {uri} ({})", file.mime);
-                    file_uris.push((uri, file.mime.clone()));
-                }
-                Err(GeminiError::RateLimited) => {
-                    rate_limited = true;
-                    break;
-                }
-                Err(GeminiError::Failed(e)) => {
-                    // Per-file tolerance: skip this attachment, keep the flow.
-                    warn!("Media upload failed for {}: {e}", file.display_name);
-                }
-            }
-        }
-        if rate_limited {
-            continue;
-        }
-
-        // Initial contents: the user's message plus uploaded media as file
-        // parts. Tool-round results append to this history.
-        let mut contents: Vec<Content> = vec![Content {
-            role: "user".to_string(),
-            parts: {
-                let mut parts = vec![Part::Text {
-                    text: user_text.to_string(),
-                    thought_signature: None,
-                }];
-                for (uri, mime) in &file_uris {
-                    parts.push(Part::FileData {
-                        file_data: FileData {
-                            mime_type: mime.clone(),
-                            file_uri: uri.clone(),
-                        },
-                    });
-                }
-                parts
-            },
-        }];
-
-        let (tools_enabled, max_rounds, url_context_enabled, search_grounding_enabled, games_enabled) = {
+    // Tool declarations are model-independent: read the knobs once per flow.
+    let declarations = {
+        let (tools_enabled, url_context_enabled, search_grounding_enabled, games_enabled) = {
             let tools_enabled = tool_ctx.tools_enabled().await;
-            let max_rounds = tool_ctx.max_tool_rounds().await;
             let url_context_enabled = tool_ctx.url_context_enabled().await;
             let search_grounding_enabled = tool_ctx.search_grounding_enabled().await;
             let games_enabled = tool_ctx.games_enabled().await;
-            (
-                tools_enabled,
-                max_rounds,
-                url_context_enabled,
-                search_grounding_enabled,
-                games_enabled,
-            )
+            (tools_enabled, url_context_enabled, search_grounding_enabled, games_enabled)
         };
+        if tools_enabled {
+            tool_declarations(url_context_enabled, search_grounding_enabled, games_enabled)
+        } else {
+            Vec::new()
+        }
+    };
+    let max_rounds = tool_ctx.max_tool_rounds().await;
 
-        match run_tool_rounds(
-            gemini,
-            &lease,
-            system_prompt,
-            &mut contents,
-            tool_ctx,
-            tools_enabled,
-            max_rounds,
-            url_context_enabled,
-            search_grounding_enabled,
-            games_enabled,
-        )
-        .await
-        {
-            Ok((text, sources)) => {
-                gemini.flow_success(&lease);
-                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
-                return Ok((text, sources));
+    // Model arms: the primary first, then the saturation fallback if one is
+    // configured (and differs). Parked models are skipped entirely — zero
+    // API calls while Google sheds their load.
+    let primary = gemini.generation_model();
+    let mut models: Vec<String> = vec![primary.clone()];
+    if let Some(fb) = gemini.fallback_generation_model() {
+        if fb != primary {
+            models.push(fb);
+        }
+    }
+
+    'models: for model in &models {
+        if gemini.model_parked(model) {
+            info!("Model {model} is parked (overload cooldown); skipping its arms");
+            continue;
+        }
+        for _ in 0..max_flows {
+            let lease = match gemini.acquire_lease() {
+                Some(l) => l,
+                None => {
+                    // Every key is cooling down: wait for the earliest to thaw.
+                    gemini.wait_for_cooldown().await;
+                    continue;
+                }
+            };
+
+            let mut file_uris: Vec<(String, String)> = Vec::new();
+            let mut rate_limited = false;
+            for file in media_files {
+                tool_ctx.meter.upload();
+                match gemini
+                    .upload_file_with(&lease, &file.data, &file.mime, &file.display_name)
+                    .await
+                {
+                    Ok(uri) => {
+                        info!("Media uploaded to Gemini: {uri} ({})", file.mime);
+                        file_uris.push((uri, file.mime.clone()));
+                    }
+                    Err(GeminiError::RateLimited) => {
+                        rate_limited = true;
+                        break;
+                    }
+                    Err(GeminiError::Failed(e)) => {
+                        // Per-file tolerance: skip this attachment, keep the flow.
+                        warn!("Media upload failed for {}: {e}", file.display_name);
+                    }
+                }
             }
-            Err(ToolsFlowError::RateLimited) => {
-                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+            if rate_limited {
                 continue;
             }
-            Err(ToolsFlowError::Failed(e)) => {
-                flush_pending_profile_scans(tool_ctx, &mut flushed).await;
-                last_err = Some(e);
-                break;
+
+            // Initial contents: the user's message plus uploaded media as file
+            // parts. Tool-round results append to this history.
+            let mut contents: Vec<Content> = vec![Content {
+                role: "user".to_string(),
+                parts: {
+                    let mut parts = vec![Part::Text {
+                        text: user_text.to_string(),
+                        thought_signature: None,
+                    }];
+                    for (uri, mime) in &file_uris {
+                        parts.push(Part::FileData {
+                            file_data: FileData {
+                                mime_type: mime.clone(),
+                                file_uri: uri.clone(),
+                            },
+                        });
+                    }
+                    parts
+                },
+            }];
+
+            match run_tool_rounds(
+                gemini,
+                &lease,
+                model,
+                system_prompt,
+                &mut contents,
+                tool_ctx,
+                &declarations,
+                max_rounds,
+            )
+            .await
+            {
+                Ok((text, sources)) => {
+                    gemini.flow_success(&lease);
+                    flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                    return Ok((text, sources));
+                }
+                Err(ToolsFlowError::RateLimited) => {
+                    // KEY-level trouble: next arm re-leases on the next key,
+                    // still on this model.
+                    flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                    continue;
+                }
+                Err(ToolsFlowError::Failed(e)) if is_transient_exhausted(&e) => {
+                    // MODEL-level exhaustion (already parked by the client):
+                    // stop burning arms on it, try the next model.
+                    flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                    warn!(
+                        "Model {model} exhausted its transient retries; \
+                         moving to the next model arm"
+                    );
+                    last_err = Some(e);
+                    continue 'models;
+                }
+                Err(ToolsFlowError::Failed(e)) => {
+                    flush_pending_profile_scans(tool_ctx, &mut flushed).await;
+                    last_err = Some(e);
+                    break 'models;
+                }
             }
         }
     }
@@ -2928,21 +2979,13 @@ async fn generate_with_tools_failover(
 async fn run_tool_rounds(
     gemini: &GeminiClient,
     lease: &KeyLease,
+    model: &str,
     system_prompt: &str,
     contents: &mut Vec<Content>,
     tool_ctx: &ToolContext,
-    tools_enabled: bool,
+    declarations: &[Tool],
     max_rounds: usize,
-    url_context_enabled: bool,
-    search_grounding_enabled: bool,
-    games_enabled: bool,
 ) -> Result<(String, ReplySources), ToolsFlowError> {
-    let declarations = if tools_enabled {
-        tool_declarations(url_context_enabled, search_grounding_enabled, games_enabled)
-    } else {
-        Vec::new()
-    };
-
     // Per-flow cache of executed calls: if the model repeats an identical call
     // (same name + args) in a later round, we answer with a one-line marker
     // instead of re-executing and re-echoing a large result into the history.
@@ -2953,7 +2996,7 @@ async fn run_tool_rounds(
     for _ in 0..max_rounds {
         tool_ctx.meter.gen();
         let turn = match gemini
-            .generate_turn_with(lease, system_prompt, contents, &declarations)
+            .generate_turn_with(lease, model, system_prompt, contents, declarations)
             .await
         {
             Ok(t) => t,
@@ -3006,7 +3049,7 @@ async fn run_tool_rounds(
     }
     tool_ctx.meter.gen();
     let final_turn = match gemini
-        .generate_turn_with(lease, system_prompt, contents, &[])
+        .generate_turn_with(lease, model, system_prompt, contents, &[])
         .await
     {
         Ok(t) => t,
@@ -3514,6 +3557,25 @@ mod tests {
         // Blank titles are skipped.
         let blank = ReplySources { urls: vec![], titles: vec!["  ".to_string()] };
         assert_eq!(append_sources_footer("a", &blank), "a");
+    }
+
+    #[test]
+    fn capacity_pauses_never_poison_mark() {
+        use crate::gemini_client::TransientExhausted;
+        // All-keys-cooling and transient (5xx) exhaustion are capacity
+        // pauses: retried uncounted, never counted toward the drop budget.
+        let quota = anyhow::Error::new(AllKeysRateLimited);
+        assert!(is_capacity_pause(&quota));
+        let overload =
+            anyhow::Error::new(TransientExhausted::new(anyhow::anyhow!("HTTP 503 high demand")));
+        assert!(is_capacity_pause(&overload));
+        let wrapped = overload.context("generate flow failed");
+        assert!(is_capacity_pause(&wrapped), "detected through context layers");
+        // Real failures stay real.
+        let broken = anyhow::anyhow!("model exhausted 6 tool rounds without a final answer");
+        assert!(!is_capacity_pause(&broken));
+        let rejected = anyhow::anyhow!("Gemini API error (HTTP 404)");
+        assert!(!is_capacity_pause(&rejected));
     }
 
     #[test]
